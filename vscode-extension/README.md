@@ -4,7 +4,7 @@ Runs the Claude Code VS Code extension inside a Docker Sandbox (`sbx`) and shows
 
 ## Setup
 
-Run **Claude sbx: Set Up Sandboxed Claude** from the command palette (you're also asked on first start). It installs the bundled `claude-sbx` wrapper to `~/.local/bin/claude-sbx`, sets `claudeCode.claudeProcessWrapper`, finds or creates the sandbox for the open folder, checks that `claude --version` works inside it, and offers to reload. **Claude sbx: Remove Sandboxed Claude Setup** undoes it.
+Run **Claude sbx: Set Up Sandboxed Claude** from the command palette (you're also asked on first start). It installs the bundled `claude-sbx` wrapper to `~/.local/bin/claude-sbx`, sets `claudeCode.claudeProcessWrapper`, finds or creates the sandbox for the open folder, checks that `claude --version` works inside it, and offers to reload. **Claude sbx: Uninstall Sandbox Wrapper** undoes it.
 
 ## Badge
 
@@ -16,7 +16,7 @@ The status bar badge shows whether the Claude Code VS Code extension is running 
 | `sbx: <name> ⚠` | Sandbox is stopped, or this folder isn't mounted in it |
 | `sbx: no sandbox` | No sandbox mounts this folder. You'll be asked whether to create one |
 | `sbx: <name> not found` / `sbx: error` / `sbx: wrapper missing` | Something is misconfigured; hover for details |
-| `Claude: local` | `claudeCode.claudeProcessWrapper` isn't set to `claude-sbx` |
+| `Claude: no sandbox` | `claudeCode.claudeProcessWrapper` isn't set to `claude-sbx` |
 
 Click the badge to refresh, switch the wrapper on or off (then reload the window), start a stopped sandbox, create a sandbox for this folder, or remove it (`sbx rm`, asks first; your project files stay).
 
@@ -31,4 +31,4 @@ The badge reflects your settings and the sandbox state (`sbx ls --json`). It can
 - `claudeSbx.sbxPath`: full path to `sbx` if VS Code can't find it
 - `claudeSbx.wrapperPath`: wrapper to use when turning the sandbox on (default `~/.local/bin/claude-sbx`)
 - `claudeSbx.refreshIntervalSeconds`: default 15
-- `claudeSbx.showWhenLocal`: show the `Claude: local` badge (default true)
+- `claudeSbx.showWhenLocal`: show the `Claude: no sandbox` badge (default true)

@@ -71,3 +71,9 @@ test('wrapperText writes the found sbx path into the bundled wrapper', () => {
   fs.writeFileSync(path.join(dir, 'claude-sbx'), '#!/bin/bash\necho no sbx line\n');
   assert.throws(() => t.wrapperText(ctx, '/x/sbx'), /no SBX_BIN line/);
 });
+
+test('isClaudePanelViewType matches Claude Code conversation tabs only', () => {
+  assert.equal(t.isClaudePanelViewType('mainThreadWebview-claudeVSCodePanel'), true);
+  assert.equal(t.isClaudePanelViewType('mainThreadWebview-markdown.preview'), false);
+  assert.equal(t.isClaudePanelViewType(undefined), false);
+});
