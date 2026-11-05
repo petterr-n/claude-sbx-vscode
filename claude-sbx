@@ -3,14 +3,63 @@
 #
 # The VS Code extension launches: <wrapper> <path-to-bundled-claude> <args...>
 # We drop the host binary path and run `claude` inside the sandbox instead.
+#
+# Which sandbox: CLAUDE_SBX_NAME if set, otherwise the sandbox whose workspace contains
+# the current folder (from `sbx ls --json`).
 set -euo pipefail
 
-SANDBOX="${CLAUDE_SBX_NAME:-claude-sandbox}"
 SBX_BIN="${CLAUDE_SBX_BIN:-sbx}"
 
 # If the first argument is the host's claude executable, skip it.
 if [[ $# -gt 0 && "$1" != -* && -x "$1" ]]; then
   shift
+fi
+
+# Picks the sandbox with the most specific workspace containing argv[0]. Same logic as the status extension.
+# shellcheck disable=SC2016
+FIND_JS='function run(argv) {
+  var dir = argv[0].replace(/\/+$/, ""), list = JSON.parse(argv[1]), best = "", bestLen = -1;
+  if (!Array.isArray(list)) return "";
+  list.forEach(function (s) {
+    if (!s || !s.name) return;
+    var roots = (s.workspaces || []).concat((s.mounts || []).map(function (m) { return String(m).split(":")[0]; }));
+    roots.forEach(function (r) {
+      if (typeof r !== "string") return;
+      r = r.replace(/\/+$/, "");
+      if (r && (dir === r || dir.indexOf(r + "/") === 0) && r.length > bestLen) { best = s.name; bestLen = r.length; }
+    });
+  });
+  return best;
+}'
+
+# Prints the sandbox name. Exit 1: no sandbox mounts the folder. Exit 2: couldn't check.
+find_sandbox() {
+  local json
+  json="$("$SBX_BIN" ls --json 2>/dev/null)" || return 2
+  local name
+  if command -v node >/dev/null 2>&1; then
+    name="$(node -e "$FIND_JS; process.stdout.write(run(process.argv.slice(1)))" "$1" "$json" 2>/dev/null)" || return 2
+  elif [[ -x /usr/bin/osascript ]]; then
+    name="$(/usr/bin/osascript -l JavaScript -e "$FIND_JS" "$1" "$json" 2>/dev/null)" || return 2
+  else
+    return 2
+  fi
+  [[ -n "$name" ]] || return 1
+  printf '%s\n' "$name"
+}
+
+SANDBOX="${CLAUDE_SBX_NAME:-}"
+if [[ -z "$SANDBOX" ]]; then
+  status=0
+  SANDBOX="$(find_sandbox "$PWD")" || status=$?
+  if [[ $status -eq 1 ]]; then
+    echo "claude-sbx: no Docker Sandbox mounts $PWD." >&2
+    echo "Create one with: sbx create claude \"$PWD\"" >&2
+    exit 1
+  elif [[ $status -ne 0 ]]; then
+    # Couldn't read `sbx ls --json`: fall back to sbx's default name, <agent>-<folder>.
+    SANDBOX="claude-$(basename "$PWD")"
+  fi
 fi
 
 # -i keeps stdin open; NO -t: the extension speaks JSON over stdio and a TTY corrupts it.

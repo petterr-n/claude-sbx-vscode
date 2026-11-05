@@ -12,3 +12,5 @@ Run the Claude Code VS Code extension with Claude inside a Docker Sandbox (`sbx`
    ```json
    "claudeCode.claudeProcessWrapper": "/Users/<you>/bin/claude-sbx"
    ```
+
+The wrapper runs Claude in the sandbox that mounts the open folder (found with `sbx ls --json`). Create one per project with `sbx create claude <folder>`, or set `CLAUDE_SBX_NAME` to always use one sandbox.
