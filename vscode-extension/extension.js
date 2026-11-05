@@ -21,6 +21,9 @@ const CLAUDE_SECTION = 'claudeCode';
 const WRAPPER_KEY = 'claudeProcessWrapper';
 const LAST_WRAPPER_KEY = 'claudeSbx.lastWrapper';
 const NEVER_CREATE_KEY = 'claudeSbx.neverOfferCreate';
+const SETUP_PROMPTED_KEY = 'claudeSbx.setupPrompted';
+// The line in the bundled wrapper where setup writes in the sbx path it found.
+const SBX_BIN_LINE = /^SBX_BIN="\$\{CLAUDE_SBX_BIN:-[^}]*\}"$/m;
 // macOS GUI apps often don't inherit the shell PATH, so look in the usual places too.
 const SBX_CANDIDATES = ['/opt/homebrew/bin/sbx', '/usr/local/bin/sbx', path.join(os.homedir(), '.docker/bin/sbx')];
 
@@ -193,7 +196,7 @@ async function refresh() {
 
     if (!isExecutable(wrapperPath)) {
       lastState.kind = 'wrapper-missing';
-      show(`$(warning) sbx: wrapper missing`, `\`${wrapperPath}\` doesn't exist or isn't executable, so the Claude panel can't start.`, true);
+      show(`$(warning) sbx: wrapper missing`, `\`${wrapperPath}\` doesn't exist or isn't executable, so the Claude panel can't start.\n\nRun **Claude sbx: Set Up Sandboxed Claude** to install it.`, true);
       return;
     }
 
@@ -288,7 +291,8 @@ async function toggle(context) {
   } else {
     const target = expandHome(context.globalState.get(LAST_WRAPPER_KEY) || cfg().get('wrapperPath', '~/bin/claude-sbx'));
     if (!isExecutable(target)) {
-      vscode.window.showErrorMessage(`Wrapper not found or not executable: ${target}. Set claudeSbx.wrapperPath.`);
+      const choice = await vscode.window.showErrorMessage(`Wrapper not found or not executable: ${target}.`, 'Run setup');
+      if (choice === 'Run setup') await setup(context);
       return;
     }
     const scope = info && info.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
@@ -321,11 +325,17 @@ function offerCreate(folder) {
     });
 }
 
-/** Creates one sandbox mounting all open folders, named like sbx's default (claude-<folder>). */
-async function createSandbox() {
+/**
+ * Creates one sandbox mounting all open folders, named like sbx's default (claude-<folder>).
+ * Returns the name of the sandbox that mounts the folder afterwards, or undefined.
+ * `quiet`: don't offer a reload at the end (setup does that itself).
+ * @param {{ sbx?: string, quiet?: boolean }} [opts]
+ * @returns {Promise<string | undefined>}
+ */
+async function createSandbox(opts = {}) {
   const folders = workspaceFolderPaths();
-  const sbx = lastState.sbx || resolveSbx(expandHome(currentWrapper()));
-  if (!folders.length || creating) return;
+  const sbx = opts.sbx || lastState.sbx || resolveSbx(expandHome(currentWrapper()));
+  if (!folders.length || creating) return undefined;
   creating = true;
   try {
     let list = [];
@@ -333,12 +343,12 @@ async function createSandbox() {
       list = await sbxList(sbx);
     } catch (e) {
       vscode.window.showErrorMessage(`Couldn't list sandboxes: ${e.message}`);
-      return;
+      return undefined;
     }
     const existing = sandboxForFolder(list, folders[0]);
     if (existing) {
-      vscode.window.showInformationMessage(`Sandbox ${existing.name} already mounts this folder.`);
-      return;
+      if (!opts.quiet) vscode.window.showInformationMessage(`Sandbox ${existing.name} already mounts this folder.`);
+      return existing.name;
     }
     const name = newSandboxName(list, folders[0]);
     const args = ['create', '--name', name, 'claude', ...folders];
@@ -387,15 +397,245 @@ async function createSandbox() {
           );
         })
     );
-    if (ok) {
-      await refresh();
-      await offerReload(`Sandbox ${name} created. Reload the window so the Claude panel starts inside it.`);
-    } else {
-      await refresh();
-    }
+    await refresh();
+    if (ok && !opts.quiet) await offerReload(`Sandbox ${name} created. Reload the window so the Claude panel starts inside it.`);
+    return ok ? name : undefined;
   } finally {
     creating = false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// One-command setup: install the wrapper, point the Claude extension at it, make sure the
+// open folder has a sandbox, and check that Claude actually starts inside it.
+
+/** @returns {Promise<{ ok: boolean, stdout: string, stderr: string }>} */
+function run(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout: 15000, maxBuffer: 4 * 1024 * 1024, ...opts }, (err, stdout, stderr) =>
+      resolve({ ok: !err, stdout: String(stdout || ''), stderr: String(stderr || (err && err.message) || '') })
+    );
+  });
+}
+
+function stamp(msg) {
+  log.appendLine(`[${new Date().toISOString()}] ${msg}`);
+}
+
+/** Full path to sbx: setting/env/usual places, else the user's login shell (GUI apps on macOS don't get its PATH). */
+async function findSbx() {
+  const candidate = resolveSbx('');
+  if (candidate !== 'sbx') return isExecutable(candidate) ? candidate : undefined;
+  const shell = process.env.SHELL || '/bin/zsh';
+  const r = await run(shell, ['-lc', 'command -v sbx']);
+  const found = r.stdout
+    .split('\n')
+    .map((l) => l.trim())
+    .reverse()
+    .find((l) => l.startsWith('/'));
+  if (found && isExecutable(found)) return found;
+  if ((await run('sbx', ['ls', '--json'])).ok) return 'sbx';
+  return undefined;
+}
+
+/** The bundled wrapper with the sbx path written in as its default. */
+function wrapperText(context, sbx) {
+  const template = fs.readFileSync(path.join(context.extensionPath, 'claude-sbx'), 'utf8');
+  if (!SBX_BIN_LINE.test(template)) throw new Error('bundled claude-sbx has no SBX_BIN line to fill in');
+  return sbx.includes('/') ? template.replace(SBX_BIN_LINE, `SBX_BIN="\${CLAUDE_SBX_BIN:-${sbx}}"`) : template;
+}
+
+/** Writes the wrapper to claudeSbx.wrapperPath. Asks before replacing a different file. Returns its path, or undefined if cancelled. */
+async function installWrapper(context, sbx) {
+  const target = expandHome(cfg().get('wrapperPath', '~/bin/claude-sbx'));
+  const text = wrapperText(context, sbx);
+  /** @type {string | undefined} */
+  let existing;
+  try {
+    existing = fs.readFileSync(target, 'utf8');
+  } catch {
+    existing = undefined;
+  }
+  if (existing === text) {
+    fs.chmodSync(target, 0o755);
+    stamp(`wrapper already up to date: ${target}`);
+    return target;
+  }
+  if (existing !== undefined) {
+    const choice = await vscode.window.showWarningMessage(
+      `${target} already exists and is different from the wrapper bundled with this extension.`,
+      { modal: true, detail: 'Replace keeps a copy of the old file as claude-sbx.bak.' },
+      'Replace',
+      'Keep mine'
+    );
+    if (!choice) return undefined;
+    if (choice === 'Keep mine') {
+      fs.chmodSync(target, 0o755);
+      stamp(`kept existing wrapper: ${target}`);
+      return target;
+    }
+    fs.copyFileSync(target, target + '.bak');
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, text, { mode: 0o755 });
+  fs.chmodSync(target, 0o755);
+  stamp(`installed wrapper: ${target} (sbx: ${sbx})`);
+  return target;
+}
+
+/** Sets claudeCode.claudeProcessWrapper for the user, and for the workspace too if it overrides it there. */
+async function setWrapperSetting(target) {
+  const conf = vscode.workspace.getConfiguration(CLAUDE_SECTION);
+  const info = conf.inspect(WRAPPER_KEY);
+  await conf.update(WRAPPER_KEY, target, vscode.ConfigurationTarget.Global);
+  if (info && info.workspaceValue !== undefined && info.workspaceValue !== target)
+    await conf.update(WRAPPER_KEY, target, vscode.ConfigurationTarget.Workspace);
+}
+
+/** Name of the sandbox Claude will use for the open folder, creating one if the user agrees. */
+async function ensureSandbox(sbx, wrapperPath) {
+  const list = await sbxList(sbx);
+  const explicit = explicitSandboxName(wrapperPath);
+  if (explicit) {
+    if (list.some((s) => s && s.name === explicit)) return explicit;
+    throw new Error(`no sandbox named ${explicit} (set by claudeSbx.sandboxName or CLAUDE_SBX_NAME)`);
+  }
+  const folders = workspaceFolderPaths();
+  const found = sandboxForFolder(list, folders[0]);
+  if (found) return found.name;
+  const choice = await vscode.window.showInformationMessage(
+    `No Docker Sandbox mounts "${path.basename(folders[0])}". Create one now?`,
+    { modal: true, detail: 'Runs sbx create in a terminal so you can see its output.' },
+    'Create sandbox'
+  );
+  if (choice !== 'Create sandbox') return undefined;
+  return createSandbox({ sbx, quiet: true });
+}
+
+/** Runs `claude-sbx --version` from the folder, i.e. exactly the path the Claude panel takes. */
+async function testWrapper(wrapperPath, folder) {
+  return vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'Checking that Claude starts inside the sandbox…' },
+    () => run(wrapperPath, ['--version'], { cwd: folder, timeout: 120000 })
+  );
+}
+
+/** @param {vscode.ExtensionContext} context */
+async function setup(context) {
+  await context.globalState.update(SETUP_PROMPTED_KEY, true);
+  if (process.platform === 'win32') {
+    vscode.window.showErrorMessage('Claude sbx setup supports macOS and Linux only.');
+    return;
+  }
+  stamp('setup started');
+  const fail = async (/** @type {string} */ msg) => {
+    stamp(`setup failed: ${msg}`);
+    const choice = await vscode.window.showErrorMessage(`Claude sbx setup: ${msg}`, 'Show log');
+    if (choice === 'Show log') log.show();
+  };
+
+  // 1. sbx
+  const sbx = await findSbx();
+  if (!sbx) {
+    const choice = await vscode.window.showErrorMessage(
+      "Claude sbx setup: couldn't find the sbx CLI. Install Docker Sandboxes, or set claudeSbx.sbxPath to its full path.",
+      'Open settings'
+    );
+    if (choice === 'Open settings') vscode.commands.executeCommand('workbench.action.openSettings', 'claudeSbx.sbxPath');
+    return;
+  }
+  stamp(`sbx: ${sbx}`);
+
+  // 2. wrapper
+  let wrapperPath;
+  try {
+    wrapperPath = await installWrapper(context, sbx);
+  } catch (e) {
+    return fail(`couldn't install the wrapper: ${e.message}`);
+  }
+  if (!wrapperPath) return stamp('setup cancelled');
+
+  // 3. Claude extension setting
+  await setWrapperSetting(wrapperPath);
+  await context.globalState.update(LAST_WRAPPER_KEY, wrapperPath);
+  stamp(`set ${CLAUDE_SECTION}.${WRAPPER_KEY} = ${wrapperPath}`);
+  await refresh();
+
+  const folders = workspaceFolderPaths();
+  if (!folders.length && !explicitSandboxName(wrapperPath)) {
+    await offerReload('Sandboxed Claude is set up. Open a folder to pick or create its sandbox, then reload.');
+    return;
+  }
+
+  // 4. sandbox
+  let sandbox;
+  try {
+    sandbox = await ensureSandbox(sbx, wrapperPath);
+  } catch (e) {
+    return fail(e.message);
+  }
+  if (!sandbox) {
+    stamp('no sandbox for this folder');
+    vscode.window.showWarningMessage(
+      'The wrapper is set up, but no sandbox mounts this folder yet, so the Claude panel can\'t start here. Use "Claude sbx: Create Sandbox for This Folder" when you\'re ready.'
+    );
+    return;
+  }
+  stamp(`sandbox: ${sandbox}`);
+
+  // 5. test
+  const cwd = folders[0] || os.homedir();
+  const result = await testWrapper(wrapperPath, cwd);
+  const version = (result.stdout.match(/\S+ \(Claude Code\)/) || [])[0];
+  if (!result.ok || !version) {
+    stamp(`test output:\n${result.stdout}\n${result.stderr}`);
+    return fail(`Claude didn't start inside ${sandbox}: ${result.stderr.trim().split('\n').pop() || 'no version printed'}`);
+  }
+  stamp(`test ok: ${version} in ${sandbox}`);
+  await refresh();
+
+  // 6. done
+  await offerReload(`Sandboxed Claude is ready: ${version} in sandbox ${sandbox}. Reload the window so the Claude panel starts inside it.`);
+}
+
+/** Undo setup: unset the wrapper setting and optionally delete the wrapper file. */
+async function teardown(context) {
+  const conf = vscode.workspace.getConfiguration(CLAUDE_SECTION);
+  const info = conf.inspect(WRAPPER_KEY);
+  if (info && isSbxWrapper(String(info.workspaceValue || ''))) await conf.update(WRAPPER_KEY, undefined, vscode.ConfigurationTarget.Workspace);
+  if (info && isSbxWrapper(String(info.globalValue || ''))) await conf.update(WRAPPER_KEY, undefined, vscode.ConfigurationTarget.Global);
+  stamp(`unset ${CLAUDE_SECTION}.${WRAPPER_KEY}`);
+
+  const target = expandHome(cfg().get('wrapperPath', '~/bin/claude-sbx'));
+  if (fs.existsSync(target)) {
+    const choice = await vscode.window.showInformationMessage(
+      `Claude no longer uses the sandbox. Also delete ${target}?`,
+      'Delete wrapper',
+      'Keep it'
+    );
+    if (choice === 'Delete wrapper') {
+      fs.unlinkSync(target);
+      await context.globalState.update(LAST_WRAPPER_KEY, undefined);
+      stamp(`deleted ${target}`);
+    }
+  }
+  await refresh();
+  await offerReload('Sandboxed Claude setup removed. Reload the window so the Claude panel runs locally. Your sandboxes are untouched.');
+}
+
+/** First run: offer setup once if the wrapper isn't in use. */
+function maybeOfferSetup(context) {
+  if (context.globalState.get(SETUP_PROMPTED_KEY)) return;
+  if (isSbxWrapper(currentWrapper())) {
+    context.globalState.update(SETUP_PROMPTED_KEY, true);
+    return;
+  }
+  vscode.window
+    .showInformationMessage('Run Claude Code inside a Docker Sandbox instead of directly on this machine?', 'Set up', 'Not now', "Don't ask again")
+    .then(async (choice) => {
+      if (choice === 'Set up') await setup(context);
+      if (choice === "Don't ask again") await context.globalState.update(SETUP_PROMPTED_KEY, true);
+    });
 }
 
 async function startSandbox() {
@@ -425,9 +665,12 @@ async function menu(context) {
       ? { label: '$(device-desktop) Run Claude locally', description: 'unset claudeCode.claudeProcessWrapper', run: () => toggle(context) }
       : { label: '$(vm) Run Claude in the sandbox', description: 'set claudeCode.claudeProcessWrapper', run: () => toggle(context) },
   ];
+  if (!on || lastState.kind === 'wrapper-missing')
+    picks.unshift({ label: '$(rocket) Set up sandboxed Claude', description: 'install wrapper, pick sandbox, test', run: () => setup(context) });
   if (on && lastState.kind === 'stopped') picks.push({ label: '$(play) Start sandbox', description: lastState.sandbox, run: startSandbox });
   if (on && lastState.kind === 'no-sandbox')
     picks.push({ label: '$(add) Create sandbox for this folder', description: 'sbx create claude …', run: createSandbox });
+  if (on) picks.push({ label: '$(trash) Remove sandboxed Claude setup', description: 'unset wrapper, optionally delete it', run: () => teardown(context) });
   picks.push({ label: '$(output) Show log', run: () => log.show() });
 
   const pick = await vscode.window.showQuickPick(picks, { placeHolder: 'Claude sbx' });
@@ -454,7 +697,9 @@ function activate(context) {
     vscode.commands.registerCommand('claudeSbx.menu', () => menu(context)),
     vscode.commands.registerCommand('claudeSbx.refresh', refresh),
     vscode.commands.registerCommand('claudeSbx.toggle', () => toggle(context)),
-    vscode.commands.registerCommand('claudeSbx.createSandbox', createSandbox),
+    vscode.commands.registerCommand('claudeSbx.createSandbox', () => createSandbox()),
+    vscode.commands.registerCommand('claudeSbx.setup', () => setup(context)),
+    vscode.commands.registerCommand('claudeSbx.teardown', () => teardown(context)),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('claudeSbx.refreshIntervalSeconds')) schedule();
       if (e.affectsConfiguration(`${CLAUDE_SECTION}.${WRAPPER_KEY}`) || e.affectsConfiguration('claudeSbx')) refresh();
@@ -466,6 +711,7 @@ function activate(context) {
 
   schedule();
   refresh();
+  maybeOfferSetup(context);
 }
 
 function deactivate() {}
