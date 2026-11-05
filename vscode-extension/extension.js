@@ -779,7 +779,7 @@ async function sbxInTerminal(sbx, args, title, isDone) {
 }
 
 /**
- * Removes the sandbox Claude uses for this folder (`sbx rm <name>`), after asking. Files in mounted folders
+ * Removes the sandbox Claude uses for this folder (`sbx stop` if running, then `sbx rm <name>`), after asking. Files in mounted folders
  * stay; everything inside the sandbox goes. Afterwards refresh offers to create a new one.
  */
 async function removeSandbox() {
@@ -800,8 +800,23 @@ async function removeSandbox() {
   );
   if (choice !== 'Remove sandbox') return;
 
+  // `sbx rm` refuses a running sandbox, so stop it first. Done = stopped or already gone.
+  const current = async () => (await sbxList(sbx)).find((s) => s && s.name === name);
+  const before = await current().catch(() => undefined);
+  if (!before || String(before.status) === 'running') {
+    const stopped = await sbxInTerminal(sbx, ['stop', name], `Stopping sandbox ${name}`, async () => {
+      const s = await current();
+      return !s || String(s.status) !== 'running';
+    });
+    if (!stopped) {
+      stamp(`sandbox ${name} didn't stop`);
+      vscode.window.showWarningMessage(`Sandbox ${name} didn't stop, so it wasn't removed. Check the terminal output.`);
+      return;
+    }
+  }
+
   // Success = the sandbox is gone from `sbx ls`.
-  const ok = await sbxInTerminal(sbx, ['rm', name], `Removing sandbox ${name}`, async () => !(await sbxList(sbx)).some((s) => s && s.name === name));
+  const ok = await sbxInTerminal(sbx, ['rm', name], `Removing sandbox ${name}`, async () => !(await current()));
   if (!ok) {
     stamp(`sandbox ${name} still exists`);
     vscode.window.showWarningMessage(`Sandbox ${name} wasn't removed. Check the terminal output.`);
@@ -1186,7 +1201,7 @@ async function menu(context) {
   if (on && lastState.kind === 'no-sandbox')
     picks.push({ label: '$(add) Create sandbox for this folder', description: 'sbx create claude …', run: createSandbox });
   if (on && lastState.sandbox && ['ok', 'host-run', 'stopped', 'not-mounted'].includes(lastState.kind))
-    picks.push({ label: '$(close) Remove sandbox', description: `sbx rm ${lastState.sandbox}`, run: removeSandbox });
+    picks.push({ label: '$(close) Remove sandbox', description: `sbx stop + rm ${lastState.sandbox}`, run: removeSandbox });
   if (on && unreviewed.length)
     picks.push({ label: '$(shield) Review files that run on this machine', description: `${unreviewed.length} unreviewed`, run: reviewHostRun });
   if (on) picks.push({ label: '$(trash) Remove sandboxed Claude setup', description: 'unset wrapper, optionally delete it', run: () => teardown(context) });
