@@ -725,6 +725,95 @@ function offerCreate(folder) {
 }
 
 /**
+ * Runs `sbx <args>` in a visible terminal with a cancellable progress notification. A real terminal because
+ * sbx can stall without a TTY, and you can see its output and answer any prompt there.
+ * Resolves true once `isDone()` is true (checked every few seconds and when the terminal closes), false if
+ * you cancel or close the terminal first.
+ * @param {string} sbx @param {string[]} args @param {string} title @param {() => Promise<boolean>} isDone
+ * @returns {Promise<boolean>}
+ */
+async function sbxInTerminal(sbx, args, title, isDone) {
+  const what = `sbx ${args.slice(0, 1).join(' ')}`;
+  stamp(`${sbx} ${args.join(' ')} (in terminal)`);
+  const term = vscode.window.createTerminal({ name: `sbx ${args.join(' ')}`.slice(0, 60), shellPath: sbx, shellArgs: args });
+  term.show();
+  const check = async () => {
+    try {
+      return await isDone();
+    } catch {
+      return false;
+    }
+  };
+  return vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: `${title} (see terminal)…`, cancellable: true },
+    (_progress, token) =>
+      new Promise((resolve) => {
+        let done = false;
+        /** @type {vscode.Disposable[]} */
+        const subs = [];
+        const finish = (/** @type {boolean} */ result) => {
+          if (done) return;
+          done = true;
+          clearInterval(poll);
+          subs.forEach((d) => d.dispose());
+          resolve(result);
+        };
+        const poll = setInterval(async () => {
+          if (await check()) finish(true);
+        }, 3000);
+        subs.push(
+          vscode.window.onDidCloseTerminal(async (t) => {
+            if (t !== term) return;
+            const code = t.exitStatus && t.exitStatus.code;
+            stamp(`${what} exited (code ${code ?? 'unknown'})`);
+            finish(await check());
+          }),
+          token.onCancellationRequested(() => {
+            stamp(`${what} cancelled`);
+            term.dispose();
+            finish(false);
+          })
+        );
+      })
+  );
+}
+
+/**
+ * Removes the sandbox Claude uses for this folder (`sbx rm <name>`), after asking. Files in mounted folders
+ * stay; everything inside the sandbox goes. Afterwards refresh offers to create a new one.
+ */
+async function removeSandbox() {
+  const { sandbox: name, sbx } = lastState;
+  if (!name || !sbx) {
+    vscode.window.showErrorMessage('Claude sbx: no sandbox to remove for this folder. Hover the status bar badge for details.');
+    return;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    `Remove sandbox ${name}?`,
+    {
+      modal: true,
+      detail:
+        'Deletes the sandbox and everything inside it: Claude\'s history and settings there, installed tools and temp files. ' +
+        'Your project files on this machine are not touched.\n\nA Claude session running in this sandbox will stop.',
+    },
+    'Remove sandbox'
+  );
+  if (choice !== 'Remove sandbox') return;
+
+  // Success = the sandbox is gone from `sbx ls`.
+  const ok = await sbxInTerminal(sbx, ['rm', name], `Removing sandbox ${name}`, async () => !(await sbxList(sbx)).some((s) => s && s.name === name));
+  if (!ok) {
+    stamp(`sandbox ${name} still exists`);
+    vscode.window.showWarningMessage(`Sandbox ${name} wasn't removed. Check the terminal output.`);
+    return;
+  }
+  stamp(`removed sandbox ${name}`);
+  // Let refresh offer to create a new sandbox for these folders right away.
+  workspaceFolderPaths().forEach((f) => offered.delete(f));
+  await refresh();
+}
+
+/**
  * Creates one sandbox mounting all open folders, named like sbx's default (claude-<folder>).
  * Returns the name of the sandbox that mounts the folder afterwards, or undefined.
  * `quiet`: don't offer a reload at the end (setup does that itself).
@@ -775,51 +864,11 @@ async function createSandbox(opts = {}) {
       if (choice !== 'Create sandbox') return undefined;
     }
     const args = ['create', '--name', name, 'claude', ...folders];
-    log.appendLine(`[${new Date().toISOString()}] ${sbx} ${args.join(' ')} (in terminal)`);
-    // Run in a real terminal: sbx create can stall without a TTY, and any prompt it shows can be answered there.
-    const term = vscode.window.createTerminal({ name: `sbx create ${name}`, shellPath: sbx, shellArgs: args });
-    term.show();
-    const ok = await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `Creating sandbox ${name} (see terminal)…`, cancellable: true },
-      (_progress, token) =>
-        new Promise((resolve) => {
-          let done = false;
-          /** @type {vscode.Disposable[]} */
-          const subs = [];
-          const finish = (/** @type {boolean} */ result) => {
-            if (done) return;
-            done = true;
-            clearInterval(poll);
-            subs.forEach((d) => d.dispose());
-            resolve(result);
-          };
-          // Success = the new sandbox shows up as running in `sbx ls`.
-          const isUp = async () => {
-            try {
-              const s = (await sbxList(sbx)).find((x) => x && x.name === name);
-              return !!s && String(s.status) === 'running';
-            } catch {
-              return false;
-            }
-          };
-          const poll = setInterval(async () => {
-            if (await isUp()) finish(true);
-          }, 3000);
-          subs.push(
-            vscode.window.onDidCloseTerminal(async (t) => {
-              if (t !== term) return;
-              const code = t.exitStatus && t.exitStatus.code;
-              log.appendLine(`[${new Date().toISOString()}] sbx create exited (code ${code ?? 'unknown'})`);
-              finish(await isUp());
-            }),
-            token.onCancellationRequested(() => {
-              log.appendLine(`[${new Date().toISOString()}] sbx create cancelled`);
-              term.dispose();
-              finish(false);
-            })
-          );
-        })
-    );
+    // Success = the new sandbox shows up as running in `sbx ls`.
+    const ok = await sbxInTerminal(sbx, args, `Creating sandbox ${name}`, async () => {
+      const s = (await sbxList(sbx)).find((x) => x && x.name === name);
+      return !!s && String(s.status) === 'running';
+    });
     await refresh();
     if (ok && !opts.quiet) await offerReload(`Sandbox ${name} created. Reload the window so the Claude panel starts inside it.`);
     return ok ? name : undefined;
@@ -1136,6 +1185,8 @@ async function menu(context) {
   if (on && lastState.kind === 'stopped') picks.push({ label: '$(play) Start sandbox', description: lastState.sandbox, run: startSandbox });
   if (on && lastState.kind === 'no-sandbox')
     picks.push({ label: '$(add) Create sandbox for this folder', description: 'sbx create claude …', run: createSandbox });
+  if (on && lastState.sandbox && ['ok', 'host-run', 'stopped', 'not-mounted'].includes(lastState.kind))
+    picks.push({ label: '$(close) Remove sandbox', description: `sbx rm ${lastState.sandbox}`, run: removeSandbox });
   if (on && unreviewed.length)
     picks.push({ label: '$(shield) Review files that run on this machine', description: `${unreviewed.length} unreviewed`, run: reviewHostRun });
   if (on) picks.push({ label: '$(trash) Remove sandboxed Claude setup', description: 'unset wrapper, optionally delete it', run: () => teardown(context) });
@@ -1166,6 +1217,7 @@ function activate(context) {
     vscode.commands.registerCommand('claudeSbx.refresh', refresh),
     vscode.commands.registerCommand('claudeSbx.toggle', () => toggle(context)),
     vscode.commands.registerCommand('claudeSbx.createSandbox', () => createSandbox()),
+    vscode.commands.registerCommand('claudeSbx.removeSandbox', () => removeSandbox()),
     vscode.commands.registerCommand('claudeSbx.setup', () => setup(context)),
     vscode.commands.registerCommand('claudeSbx.teardown', () => teardown(context)),
     vscode.workspace.onDidChangeConfiguration((e) => {
