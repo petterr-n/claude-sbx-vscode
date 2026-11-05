@@ -31,7 +31,7 @@ code --install-extension claude-sbx-status-*.vsix
 2. Run **Claude sbx: Set Up Sandboxed Claude** from the command palette, or accept the prompt shown on first start. It installs the wrapper to `~/.local/bin/claude-sbx`, points the Claude extension at it, finds or creates a sandbox for the folder, and checks that Claude starts inside it.
 3. Click **Reload Window** when asked.
 
-The status bar shows `sbx: <sandbox> ✓` when Claude runs in the sandbox. To undo, run **Claude sbx: Remove Sandboxed Claude Setup**.
+The status bar shows `sbx: <sandbox> ✓` when Claude runs in the sandbox. To undo, run **Claude sbx: Uninstall Sandbox Wrapper**.
 
 ### Manual setup (without the extension)
 
