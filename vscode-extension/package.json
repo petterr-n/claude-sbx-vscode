@@ -1,0 +1,78 @@
+{
+  "name": "claude-sbx-status",
+  "displayName": "Claude sbx Status",
+  "description": "Status bar badge showing whether the Claude Code extension runs inside a Docker Sandbox (sbx).",
+  "version": "0.2.0",
+  "publisher": "petterr-n",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/petterr-n/claude-sbx-vscode"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeSbx.menu",
+        "title": "Claude sbx: Show Menu"
+      },
+      {
+        "command": "claudeSbx.refresh",
+        "title": "Claude sbx: Refresh Status"
+      },
+      {
+        "command": "claudeSbx.toggle",
+        "title": "Claude sbx: Toggle Sandbox Wrapper"
+      },
+      {
+        "command": "claudeSbx.createSandbox",
+        "title": "Claude sbx: Create Sandbox for This Folder"
+      }
+    ],
+    "configuration": {
+      "title": "Claude sbx Status",
+      "properties": {
+        "claudeSbx.sandboxName": {
+          "type": "string",
+          "default": "",
+          "description": "Use this sandbox for every folder. Leave empty to use CLAUDE_SBX_NAME, or else the sandbox whose workspace contains the open folder (same as the wrapper)."
+        },
+        "claudeSbx.offerCreate": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the sandbox wrapper is on and no sandbox mounts the open folder, offer to create one (sbx create claude <folder>)."
+        },
+        "claudeSbx.sbxPath": {
+          "type": "string",
+          "default": "",
+          "description": "Full path to the sbx CLI. Leave empty to use CLAUDE_SBX_BIN, the wrapper's default, or common install locations."
+        },
+        "claudeSbx.wrapperPath": {
+          "type": "string",
+          "default": "~/bin/claude-sbx",
+          "description": "Wrapper to set as claudeCode.claudeProcessWrapper when turning the sandbox on."
+        },
+        "claudeSbx.refreshIntervalSeconds": {
+          "type": "number",
+          "default": 15,
+          "minimum": 3,
+          "description": "How often to check the sandbox status."
+        },
+        "claudeSbx.showWhenLocal": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a 'Claude: local' badge when the sandbox wrapper isn't in use."
+        }
+      }
+    }
+  }
+}
