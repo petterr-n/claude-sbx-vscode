@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# claude-sbx — run Claude Code inside a Docker Sandbox (sbx) from the VS Code extension.
+#
+# The VS Code extension launches: <wrapper> <path-to-bundled-claude> <args...>
+# We drop the host binary path and run `claude` inside the sandbox instead.
+set -euo pipefail
+
+SANDBOX="${CLAUDE_SBX_NAME:-claude-sandbox}"
+SBX_BIN="${CLAUDE_SBX_BIN:-sbx}"
+
+# If the first argument is the host's claude executable, skip it.
+if [[ $# -gt 0 && "$1" != -* && -x "$1" ]]; then
+  shift
+fi
+
+# -i keeps stdin open; NO -t: the extension speaks JSON over stdio and a TTY corrupts it.
+exec "$SBX_BIN" exec -i -w "$PWD" "$SANDBOX" claude "$@"
