@@ -2,7 +2,7 @@
   "name": "claude-sbx-status",
   "displayName": "Claude sbx Status",
   "description": "Run the Claude Code VS Code extension inside a Docker Sandbox (sbx): one-command setup and a status bar badge.",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "publisher": "petterr-n",
   "license": "MIT",
   "repository": {
@@ -44,6 +44,10 @@
       {
         "command": "claudeSbx.createSandbox",
         "title": "Claude sbx: Create Sandbox for This Folder"
+      },
+      {
+        "command": "claudeSbx.removeSandbox",
+        "title": "Claude sbx: Remove Sandbox for This Folder"
       }
     ],
     "configuration": {
