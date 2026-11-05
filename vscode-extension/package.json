@@ -84,6 +84,7 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "cp ../claude-sbx ./claude-sbx && chmod +x ./claude-sbx"
+    "vscode:prepublish": "cp ../claude-sbx ./claude-sbx && chmod +x ./claude-sbx",
+    "test": "node --test test/*.test.js"
   }
 }

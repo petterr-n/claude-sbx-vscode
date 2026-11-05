@@ -716,4 +716,9 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate };
+module.exports = {
+  activate,
+  deactivate,
+  // Pure helpers, exported for the tests in test/.
+  _test: { expandHome, wrapperDefault, isUnder, sandboxRoots, sandboxForFolder, newSandboxName, wrapperText, isSbxWrapper },
+};
