@@ -4,7 +4,7 @@ Runs the Claude Code VS Code extension inside a Docker Sandbox (`sbx`) and shows
 
 ## Setup
 
-Run **Claude sbx: Set Up Sandboxed Claude** from the command palette (you're also asked on first start). It installs the bundled `claude-sbx` wrapper to `~/bin/claude-sbx`, sets `claudeCode.claudeProcessWrapper`, finds or creates the sandbox for the open folder, checks that `claude --version` works inside it, and offers to reload. **Claude sbx: Remove Sandboxed Claude Setup** undoes it.
+Run **Claude sbx: Set Up Sandboxed Claude** from the command palette (you're also asked on first start). It installs the bundled `claude-sbx` wrapper to `~/.local/bin/claude-sbx`, sets `claudeCode.claudeProcessWrapper`, finds or creates the sandbox for the open folder, checks that `claude --version` works inside it, and offers to reload. **Claude sbx: Remove Sandboxed Claude Setup** undoes it.
 
 ## Badge
 
@@ -29,18 +29,6 @@ The badge reflects your settings and the sandbox state (`sbx ls --json`). It can
 - `claudeSbx.sandboxName`: use one fixed sandbox. Empty (default) means: `CLAUDE_SBX_NAME`, else the sandbox whose workspace contains the open folder, same as the wrapper
 - `claudeSbx.offerCreate`: offer to create a sandbox for unmounted folders in sandboxed mode (default true)
 - `claudeSbx.sbxPath`: full path to `sbx` if VS Code can't find it
-- `claudeSbx.wrapperPath`: wrapper to use when turning the sandbox on (default `~/bin/claude-sbx`)
+- `claudeSbx.wrapperPath`: wrapper to use when turning the sandbox on (default `~/.local/bin/claude-sbx`)
 - `claudeSbx.refreshIntervalSeconds`: default 15
 - `claudeSbx.showWhenLocal`: show the `Claude: local` badge (default true)
-
-## Safety checks
-
-The project folder is mounted read-write in the sandbox, so code inside it can write `.vscode/settings.json`. Because of that:
-
-- `sandboxName`, `sbxPath` and `wrapperPath` are read from **user settings only**. Workspace values are ignored.
-- If workspace settings set `claudeCode.claudeProcessWrapper`, the badge shows `Claude: workspace wrapper` ⚠ and nothing is run. Setup sets the wrapper in user settings and removes the workspace value.
-- The badge shows ✓ only if the wrapper is the bundled one (or one you chose to keep during setup), and only if the wrapper and `sbx` are owned by you or root, not writable by group or others, and outside every folder a sandbox mounts. Otherwise it shows `sbx: wrapper not trusted` ⚠.
-- Setup won't install the wrapper inside a mounted folder, or write an `sbx` path containing shell characters into it.
-- Remove Setup only offers to delete the file if it's the wrapper.
-- **Files that run on this machine:** in sandboxed mode, the open folders a sandbox mounts (and git repos one level down) are checked for git config entries that run commands (`core.fsmonitor`, `core.pager`, `diff.*.textconv`, `alias.* = !…`, `include.path`, …), executable git hooks, and `.vscode/tasks.json` tasks with `"runOn": "folderOpen"`. A new or changed entry shows a notification and turns the badge ⚠. Use **Review files that run on this machine** in the menu to mark entries you made yourself; editing an entry brings it back. This detects changes but can't prevent them. For untrusted code use `sbx create --clone`.
-- **Create sandbox** refuses to mount your home folder (or a parent of it) or a folder containing the wrapper or `sbx`. If several folders are open, it lists them all and asks first.

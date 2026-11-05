@@ -25,7 +25,7 @@ const NEVER_CREATE_KEY = 'claudeSbx.neverOfferCreate';
 const SETUP_PROMPTED_KEY = 'claudeSbx.setupPrompted';
 /** SHA-256 of wrapper files you installed or chose to keep during setup. */
 const TRUSTED_HASHES_KEY = 'claudeSbx.trustedWrapperHashes';
-const DEFAULT_WRAPPER = '~/bin/claude-sbx';
+const DEFAULT_WRAPPER = '~/.local/bin/claude-sbx';
 // The line in the bundled wrapper where setup writes in the sbx path it found.
 const SBX_BIN_LINE = /^SBX_BIN="\$\{CLAUDE_SBX_BIN:-[^}]*\}"$/m;
 // Setup writes the sbx path inside a bash "…" string, so only allow characters that are plain text there
