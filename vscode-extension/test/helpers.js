@@ -23,9 +23,23 @@ function loadExtension() {
 
 const WRAPPER = path.resolve(__dirname, '..', '..', 'claude-sbx');
 
-/** A temp dir with symlinks resolved (macOS /var -> /private/var), so it matches bash's $PWD. */
+/** Temp dirs created by this test file, deleted when its process exits (each test file runs in its own process). */
+const created = [];
+process.on('exit', () => {
+  for (const dir of created) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* best effort: never fail the run over cleanup */
+    }
+  }
+});
+
+/** A temp dir with symlinks resolved (macOS /var -> /private/var), so it matches bash's $PWD. Deleted after the tests. */
 function tempDir() {
-  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sbx-test-')));
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sbx-test-')));
+  created.push(dir);
+  return dir;
 }
 
 /**
