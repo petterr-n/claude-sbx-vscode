@@ -1,6 +1,14 @@
 # Claude sbx Status
 
-Status bar badge that shows whether the Claude Code VS Code extension is running Claude inside a Docker Sandbox (`sbx`) through the `claude-sbx` wrapper.
+Runs the Claude Code VS Code extension inside a Docker Sandbox (`sbx`) and shows a status bar badge for it.
+
+## Setup
+
+Run **Claude sbx: Set Up Sandboxed Claude** from the command palette (you're also asked on first start). It installs the bundled `claude-sbx` wrapper to `~/bin/claude-sbx`, sets `claudeCode.claudeProcessWrapper`, finds or creates the sandbox for the open folder, checks that `claude --version` works inside it, and offers to reload. **Claude sbx: Remove Sandboxed Claude Setup** undoes it.
+
+## Badge
+
+The status bar badge shows whether the Claude Code VS Code extension is running Claude inside a Docker Sandbox (`sbx`) through the `claude-sbx` wrapper.
 
 | Badge | Meaning |
 |---|---|
