@@ -2,7 +2,7 @@
   "name": "claude-sbx-status",
   "displayName": "Claude sbx Status",
   "description": "Run the Claude Code VS Code extension inside a Docker Sandbox (sbx): one-command setup and a status bar badge.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publisher": "petterr-n",
   "license": "MIT",
   "repository": {
@@ -53,7 +53,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Use this sandbox for every folder. Leave empty to use CLAUDE_SBX_NAME, or else the sandbox whose workspace contains the open folder (same as the wrapper). User settings only: workspace values are ignored, since a sandbox can write workspace settings."
+          "description": "Use this sandbox for every folder. Leave empty to use CLAUDE_SBX_NAME, or else the sandbox whose workspace contains the open folder (same as the wrapper)."
         },
         "claudeSbx.offerCreate": {
           "type": "boolean",
@@ -64,13 +64,13 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Full path to the sbx CLI. Leave empty to use CLAUDE_SBX_BIN, the wrapper's default, or common install locations. User settings only: workspace values are ignored, since a sandbox can write workspace settings."
+          "description": "Full path to the sbx CLI. Leave empty to use CLAUDE_SBX_BIN, the wrapper's default, or common install locations."
         },
         "claudeSbx.wrapperPath": {
           "type": "string",
-          "default": "~/bin/claude-sbx",
+          "default": "~/.local/bin/claude-sbx",
           "scope": "machine",
-          "description": "Wrapper to set as claudeCode.claudeProcessWrapper when turning the sandbox on. User settings only: workspace values are ignored, since a sandbox can write workspace settings."
+          "description": "Wrapper to set as claudeCode.claudeProcessWrapper when turning the sandbox on."
         },
         "claudeSbx.refreshIntervalSeconds": {
           "type": "number",
