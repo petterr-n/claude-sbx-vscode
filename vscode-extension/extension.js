@@ -13,6 +13,7 @@
 
 const vscode = require('vscode');
 const { execFile } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -22,8 +23,14 @@ const WRAPPER_KEY = 'claudeProcessWrapper';
 const LAST_WRAPPER_KEY = 'claudeSbx.lastWrapper';
 const NEVER_CREATE_KEY = 'claudeSbx.neverOfferCreate';
 const SETUP_PROMPTED_KEY = 'claudeSbx.setupPrompted';
+/** SHA-256 of wrapper files you installed or chose to keep during setup. */
+const TRUSTED_HASHES_KEY = 'claudeSbx.trustedWrapperHashes';
+const DEFAULT_WRAPPER = '~/bin/claude-sbx';
 // The line in the bundled wrapper where setup writes in the sbx path it found.
 const SBX_BIN_LINE = /^SBX_BIN="\$\{CLAUDE_SBX_BIN:-[^}]*\}"$/m;
+// Setup writes the sbx path inside a bash "…" string, so only allow characters that are plain text there
+// (no $, `, ", \, } or newlines).
+const SAFE_SBX_PATH = /^\/[A-Za-z0-9 ._/+@-]+$/;
 // macOS GUI apps often don't inherit the shell PATH, so look in the usual places too.
 const SBX_CANDIDATES = ['/opt/homebrew/bin/sbx', '/usr/local/bin/sbx', path.join(os.homedir(), '.docker/bin/sbx')];
 
@@ -41,6 +48,13 @@ let ctx;
 /** Folders we've already offered to create a sandbox for in this window (refresh runs every few seconds). */
 const offered = new Set();
 let creating = false;
+/** Ids of findings you marked as reviewed (see hostRunFindings). */
+const REVIEWED_KEY = 'claudeSbx.reviewedHostRunFindings';
+/** Findings from the last refresh that you haven't reviewed yet. */
+/** @type {{ id: string, file: string, detail: string }[]} */
+let unreviewed = [];
+/** Finding ids already shown in a notification in this window. */
+const notified = new Set();
 
 function expandHome(p) {
   return p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p;
@@ -55,12 +69,16 @@ function isExecutable(p) {
   }
 }
 
+/** Reads `${VAR:-default}` from wrapper script text. */
+function defaultFromText(text, varName) {
+  const m = text.match(new RegExp('\\$\\{' + varName + ':-([^}]*)\\}'));
+  return m ? m[1].trim() : undefined;
+}
+
 /** Reads `${VAR:-default}` from the wrapper script, so the badge matches what the wrapper will do. */
 function wrapperDefault(wrapperPath, varName) {
   try {
-    const text = fs.readFileSync(wrapperPath, 'utf8');
-    const m = text.match(new RegExp('\\$\\{' + varName + ':-([^}]*)\\}'));
-    return m ? m[1].trim() : undefined;
+    return defaultFromText(fs.readFileSync(wrapperPath, 'utf8'), varName);
   } catch {
     return undefined;
   }
@@ -68,6 +86,288 @@ function wrapperDefault(wrapperPath, varName) {
 
 function cfg() {
   return vscode.workspace.getConfiguration('claudeSbx');
+}
+
+/**
+ * A claudeSbx setting, read from user settings only. These settings decide which programs run on this
+ * machine, and code inside a sandbox can write the workspace's .vscode/settings.json (the project folder
+ * is mounted read-write), so workspace values are ignored. package.json also gives these settings
+ * "machine" scope, so VS Code doesn't accept them in workspace settings.
+ * @param {string} key @param {string} fallback
+ */
+function userSetting(key, fallback) {
+  const info = cfg().inspect(key);
+  const v = info && info.globalValue !== undefined ? info.globalValue : info && info.defaultValue;
+  return String(v === undefined || v === null ? fallback : v).trim();
+}
+
+function realOrSelf(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * Says why `p` isn't safe to run, or returns undefined if it is. Checks the real file (symlinks
+ * resolved) and its folder: both must belong to you or root and must not be writable by group or others.
+ * @param {string} p
+ */
+function fileProblem(p) {
+  if (!path.isAbsolute(p)) return `${p} is not an absolute path`;
+  let real;
+  try {
+    real = fs.realpathSync(p);
+  } catch {
+    return `${p} doesn't exist`;
+  }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+  for (const f of [real, path.dirname(real)]) {
+    const st = fs.statSync(f);
+    if (uid !== undefined && st.uid !== uid && st.uid !== 0) return `${f} belongs to another user`;
+    if (st.mode & 0o022) return `${f} is writable by group or others`;
+  }
+  return undefined;
+}
+
+/** Every host path any sandbox mounts. A sandbox can write to all of them. */
+function allRoots(list) {
+  return list.flatMap((s) => (s ? sandboxRoots(s) : []));
+}
+
+/** The sandbox-mounted folder that contains `p` (as given or with symlinks resolved), if any. */
+function mountedRoot(p, roots) {
+  const candidates = [p, realOrSelf(p)];
+  return roots.find((r) => candidates.some((c) => isUnder(c, r) || isUnder(c, realOrSelf(r))));
+}
+
+/** Says whether the wrapper or the sbx it uses lives where a sandbox can change it, or returns undefined. */
+function locationProblem(wrapperPath, sbx, list) {
+  const roots = allRoots(list);
+  const w = mountedRoot(wrapperPath, roots);
+  if (w) return `${wrapperPath} is inside ${w}, which a sandbox mounts, so code in the sandbox could change it`;
+  const s = sbx.includes('/') ? mountedRoot(sbx, roots) : undefined;
+  if (s) return `sbx (${sbx}) is inside ${s}, which a sandbox mounts, so code in the sandbox could change it`;
+  return undefined;
+}
+
+function sha256(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+/** Remembers a wrapper file's contents as trusted (you installed it, or chose to keep it, during setup). */
+async function trustWrapperText(context, text) {
+  const hashes = context.globalState.get(TRUSTED_HASHES_KEY) || [];
+  const h = sha256(text);
+  if (!hashes.includes(h)) await context.globalState.update(TRUSTED_HASHES_KEY, [...hashes, h].slice(-20));
+}
+
+/**
+ * True if the file is the bundled wrapper (with a safe sbx path filled in), or contents you trusted during
+ * setup. A file that only happens to be named claude-sbx doesn't count.
+ */
+function isKnownWrapper(context, wrapperPath) {
+  let text;
+  try {
+    text = fs.readFileSync(wrapperPath, 'utf8');
+  } catch {
+    return false;
+  }
+  if ((context.globalState.get(TRUSTED_HASHES_KEY) || []).includes(sha256(text))) return true;
+  const baked = defaultFromText(text, 'CLAUDE_SBX_BIN');
+  if (baked === undefined) return false;
+  try {
+    return text === wrapperText(context, baked);
+  } catch {
+    return false;
+  }
+}
+
+/** Checks the wrapper file itself (permissions and contents). Returns a problem, or undefined. */
+function wrapperFileProblem(context, wrapperPath) {
+  const p = fileProblem(wrapperPath);
+  if (p) return p;
+  if (!isKnownWrapper(context, wrapperPath)) return `${wrapperPath} doesn't match the wrapper this extension installs`;
+  return undefined;
+}
+
+/** First workspace or folder value among `inspect()` results, i.e. a value the workspace sets rather than you. */
+function workspaceValueOf(infos) {
+  for (const i of infos) {
+    if (!i) continue;
+    if (i.workspaceValue !== undefined) return String(i.workspaceValue);
+    if (i.workspaceFolderValue !== undefined) return String(i.workspaceFolderValue);
+  }
+  return undefined;
+}
+
+/** All the places the workspace can set claudeCode.claudeProcessWrapper: the workspace and each folder. */
+function wrapperScopes() {
+  const folders = vscode.workspace.workspaceFolders || [];
+  return [
+    { conf: vscode.workspace.getConfiguration(CLAUDE_SECTION), target: vscode.ConfigurationTarget.Workspace },
+    ...folders.map((f) => ({ conf: vscode.workspace.getConfiguration(CLAUDE_SECTION, f.uri), target: vscode.ConfigurationTarget.WorkspaceFolder })),
+  ];
+}
+
+/** claudeCode.claudeProcessWrapper as set by workspace settings (not by you), if it is. */
+function workspaceWrapperValue() {
+  return workspaceValueOf(wrapperScopes().map((s) => s.conf.inspect(WRAPPER_KEY)));
+}
+
+/** Removes claudeCode.claudeProcessWrapper from workspace and folder settings. */
+async function clearWorkspaceWrapper() {
+  for (const { conf, target } of wrapperScopes()) {
+    const info = conf.inspect(WRAPPER_KEY);
+    const v = info && (target === vscode.ConfigurationTarget.Workspace ? info.workspaceValue : info.workspaceFolderValue);
+    if (v !== undefined) await conf.update(WRAPPER_KEY, undefined, target);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Files in a mounted folder that tools on this machine run. The sandbox can write them, so a change
+// there can run code outside the sandbox: git runs hooks and config commands (VS Code's Git extension
+// runs `git status` by itself, which triggers core.fsmonitor), and VS Code can run tasks when a folder opens.
+// This can only detect such changes, not prevent them. The real fix is sbx's clone mode (see README).
+
+/** Parses git config text into `section[.subsection].name` keys (section and name lowercased, like git). */
+function parseGitConfig(text) {
+  /** @type {{ key: string, value: string, line: number }[]} */
+  const out = [];
+  let section = '';
+  text.split(/\r?\n/).forEach((raw, i) => {
+    const line = raw.replace(/^\s+/, '');
+    if (!line || line[0] === '#' || line[0] === ';') return;
+    const sec = line.match(/^\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]/);
+    if (sec) {
+      // [a.b] is the old spelling of [a "b"].
+      const [name, ...rest] = sec[1].split('.');
+      const sub = sec[2] !== undefined ? sec[2].replace(/\\(.)/g, '$1') : rest.join('.');
+      section = name.toLowerCase() + (sub ? '.' + sub : '');
+      const after = line.slice(sec[0].length).trim();
+      if (!after) return;
+      // A key on the same line as its section header.
+      const kv = after.match(/^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$/);
+      if (kv && section) out.push({ key: `${section}.${kv[1].toLowerCase()}`, value: (kv[2] || 'true').trim(), line: i + 1 });
+      return;
+    }
+    const kv = line.match(/^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$/);
+    if (kv && section) out.push({ key: `${section}.${kv[1].toLowerCase()}`, value: (kv[2] || 'true').trim(), line: i + 1 });
+  });
+  return out;
+}
+
+// Git config keys whose value is a command (or a path to one, or a file of more config) that git runs.
+const GIT_COMMAND_KEYS = [
+  /^core\.(fsmonitor|hookspath|pager|editor|sshcommand|askpass|gitproxy)$/,
+  /^(sequence\.editor|diff\.external|gpg\.program|gpg\.[^.]+\.program|credential\.helper|credential\..+\.helper)$/,
+  /^diff\..+\.(textconv|command)$/,
+  /^merge\..+\.driver$/,
+  /^filter\..+\.(clean|smudge|process)$/,
+  /^pager\.[^.]+$/,
+  /^remote\..+\.(uploadpack|receivepack)$/,
+  /^(include\.path|includeif\..+\.path)$/,
+  /^(web\.browser|browser\..+\.(cmd|path)|man\..+\.(cmd|path))$/,
+];
+const GIT_BOOL = /^(true|false|yes|no|on|off|1|0|)$/i;
+
+/** Why this git config entry can run a command, or undefined. */
+function gitEntryRisk({ key, value }) {
+  // core.fsmonitor=true is git's built-in daemon; any other value is a command to run.
+  if (key === 'core.fsmonitor' && GIT_BOOL.test(value)) return undefined;
+  if (key.startsWith('pager.') && GIT_BOOL.test(value)) return undefined;
+  if (GIT_COMMAND_KEYS.some((re) => re.test(key))) return 'git runs this as a command (or loads it as config)';
+  if (key.startsWith('alias.') && value.replace(/^"/, '').startsWith('!')) return 'this alias runs a shell command';
+  if (/^(remote\..+\.(url|pushurl)|url\..+\.(insteadof|pushinsteadof))$/.test(key) && /^"?ext::/.test(value))
+    return 'an ext:: URL runs a command';
+  return undefined;
+}
+
+/** The git directory for a folder: `.git`, or where a `.git` file (worktree/submodule) points. */
+function gitDirOf(folder) {
+  const dotGit = path.join(folder, '.git');
+  try {
+    const st = fs.statSync(dotGit);
+    if (st.isDirectory()) return dotGit;
+    const m = fs.readFileSync(dotGit, 'utf8').match(/^gitdir:\s*(.+)$/m);
+    return m ? path.resolve(folder, m[1].trim()) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Things in `folder` (and git repos one level down) that would run code on this machine and that a
+ * sandbox mounting the folder could have written. Each finding has a stable id: it changes when the
+ * content changes, so a reviewed finding comes back if it's edited.
+ * @returns {{ id: string, file: string, detail: string }[]}
+ */
+function hostRunFindings(folder) {
+  /** @type {{ id: string, file: string, detail: string }[]} */
+  const found = [];
+  const add = (file, detail, content) => found.push({ id: sha256([file, detail, content].join('\0')), file, detail });
+
+  /** @type {string[]} */
+  let dirs = [folder];
+  try {
+    dirs = dirs.concat(
+      fs
+        .readdirSync(folder, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && d.name !== '.git' && d.name !== 'node_modules')
+        .map((d) => path.join(folder, d.name))
+    );
+  } catch {
+    /* unreadable folder: just check the folder itself */
+  }
+
+  for (const dir of dirs) {
+    const gitDir = gitDirOf(dir);
+    if (gitDir) {
+      const configFile = path.join(gitDir, 'config');
+      try {
+        for (const e of parseGitConfig(fs.readFileSync(configFile, 'utf8'))) {
+          const risk = gitEntryRisk(e);
+          if (risk) add(configFile, `line ${e.line}: ${e.key} = ${e.value} (${risk})`, `${e.key}=${e.value}`);
+        }
+      } catch {
+        /* no config */
+      }
+      const hooksDir = path.join(gitDir, 'hooks');
+      try {
+        for (const h of fs.readdirSync(hooksDir)) {
+          if (h.endsWith('.sample')) continue;
+          const f = path.join(hooksDir, h);
+          if (!isExecutable(f) || !fs.statSync(f).isFile()) continue;
+          add(f, `git hook "${h}" (git runs it on the matching git command)`, fs.readFileSync(f, 'utf8'));
+        }
+      } catch {
+        /* no hooks dir */
+      }
+    }
+    const tasks = path.join(dir, '.vscode', 'tasks.json');
+    try {
+      const text = fs.readFileSync(tasks, 'utf8');
+      if (/"runOn"\s*:\s*"folderOpen"/.test(text)) add(tasks, 'a task with "runOn": "folderOpen" (VS Code can run it when the folder opens)', text);
+    } catch {
+      /* no tasks.json */
+    }
+  }
+  return found;
+}
+
+/**
+ * Why a new sandbox must not mount these folders, or undefined. A mount the sandbox can write must not
+ * contain your home folder, the wrapper or sbx, or code in the sandbox could change what runs on this machine.
+ * @param {string[]} folders @param {{ home: string, wrapperPath?: string, sbx?: string }} o
+ */
+function mountRefusal(folders, { home, wrapperPath, sbx }) {
+  for (const f of folders) {
+    if (isUnder(home, f)) return `${f} is your home folder or contains it`;
+    if (wrapperPath && path.isAbsolute(wrapperPath) && mountedRoot(wrapperPath, [f])) return `${f} contains the wrapper (${wrapperPath})`;
+    if (sbx && sbx.includes('/') && mountedRoot(sbx, [f])) return `${f} contains sbx (${sbx})`;
+  }
+  return undefined;
 }
 
 function currentWrapper() {
@@ -81,7 +381,7 @@ function isSbxWrapper(wrapper) {
 /** A sandbox name set explicitly (setting, env var or wrapper default). Empty means: look it up by folder. */
 function explicitSandboxName(wrapperPath) {
   return (
-    cfg().get('sandboxName', '').trim() ||
+    userSetting('sandboxName', '') ||
     process.env.CLAUDE_SBX_NAME ||
     wrapperDefault(wrapperPath, 'CLAUDE_SBX_NAME') ||
     ''
@@ -93,7 +393,7 @@ function workspaceFolderPaths() {
 }
 
 function resolveSbx(wrapperPath) {
-  const explicit = cfg().get('sbxPath', '').trim() || process.env.CLAUDE_SBX_BIN || '';
+  const explicit = userSetting('sbxPath', '') || process.env.CLAUDE_SBX_BIN || '';
   if (explicit) return expandHome(explicit);
   const fromWrapper = wrapperDefault(wrapperPath, 'CLAUDE_SBX_BIN');
   if (fromWrapper && fromWrapper.includes('/')) return expandHome(fromWrapper);
@@ -178,6 +478,19 @@ async function refresh() {
   try {
     const wrapper = currentWrapper();
 
+    // A wrapper from workspace settings could have been written from inside a sandbox. Don't read or run
+    // anything based on it.
+    const fromWorkspace = workspaceWrapperValue();
+    if (fromWorkspace !== undefined) {
+      lastState = { kind: 'wrapper-workspace' };
+      show(
+        `$(warning) Claude: workspace wrapper`,
+        `**This workspace's settings set \`claudeCode.claudeProcessWrapper\`** to \`${fromWorkspace}\`.\n\nCode inside a sandbox can write workspace settings, so this could run code on this machine when the Claude panel starts. Remove it from the workspace settings, or run **Claude sbx: Set Up Sandboxed Claude**. Setup sets the wrapper in your user settings and clears the workspace value.`,
+        true
+      );
+      return;
+    }
+
     if (!isSbxWrapper(wrapper)) {
       lastState = { kind: 'local' };
       if (cfg().get('showWhenLocal', true)) {
@@ -190,25 +503,46 @@ async function refresh() {
     }
 
     const wrapperPath = expandHome(wrapper);
-    const explicit = explicitSandboxName(wrapperPath);
-    const sbx = resolveSbx(wrapperPath);
-    lastState = { kind: 'checking', sandbox: explicit || undefined, sbx };
+    const untrusted = (/** @type {string} */ problem) => {
+      lastState = { kind: 'wrapper-unsafe' };
+      show(
+        `$(warning) sbx: wrapper not trusted`,
+        `The Claude panel will start \`${wrapperPath}\`, but ${problem}.\n\nRun **Claude sbx: Set Up Sandboxed Claude** to reinstall it.`,
+        true
+      );
+    };
 
     if (!isExecutable(wrapperPath)) {
-      lastState.kind = 'wrapper-missing';
+      lastState = { kind: 'wrapper-missing' };
       show(`$(warning) sbx: wrapper missing`, `\`${wrapperPath}\` doesn't exist or isn't executable, so the Claude panel can't start.\n\nRun **Claude sbx: Set Up Sandboxed Claude** to install it.`, true);
       return;
     }
+    // Check the wrapper before using the sbx path written into it.
+    const fileIssue = wrapperFileProblem(ctx, wrapperPath);
+    if (fileIssue) return untrusted(fileIssue);
+
+    const sbx = resolveSbx(wrapperPath);
+    const sbxIssue = sbx.includes('/') ? fileProblem(sbx) : undefined;
+    if (sbxIssue) return untrusted(`the sbx it runs isn't safe: ${sbxIssue}`);
 
     let list;
     try {
       list = await sbxList(sbx);
     } catch (e) {
-      lastState.kind = 'sbx-error';
+      lastState = { kind: 'sbx-error' };
       log.appendLine(`[${new Date().toISOString()}] ${sbx} ls --json failed: ${e.message}`);
       show(`$(warning) sbx: error`, `Couldn't run \`${sbx} ls --json\`:\n\n\`${e.message}\`\n\nSet **claudeSbx.sbxPath** if sbx isn't found.`, true);
       return;
     }
+
+    const where = locationProblem(wrapperPath, sbx, list);
+    if (where) return untrusted(where);
+
+    scanHostRunFiles(list);
+
+    const explicit = explicitSandboxName(wrapperPath);
+    // Only set once sbx has passed every check: start/create use lastState.sbx.
+    lastState = { kind: 'checking', sandbox: explicit || undefined, sbx };
 
     const folders = workspaceFolderPaths();
     if (!explicit && !folders.length) {
@@ -259,6 +593,20 @@ async function refresh() {
       return;
     }
 
+    if (unreviewed.length) {
+      lastState.kind = 'host-run';
+      show(
+        `$(vm-running) sbx: ${name} $(warning)`,
+        `**Claude runs inside Docker Sandbox \`${name}\`**, but the mounted folder has ${unreviewed.length} thing(s) that tools on this machine run, which code in the sandbox could have written:\n\n${unreviewed
+          .slice(0, 5)
+          // The details come from files the sandbox can write: keep them out of Markdown syntax.
+          .map((f) => `- \`${f.file.replace(/`/g, "'")}\`: ${f.detail.replace(/[`*_[\]<>\\]/g, ' ')}`)
+          .join('\n')}\n\nPick **Review files that run on this machine** from the menu.`,
+        true
+      );
+      return;
+    }
+
     lastState.kind = 'ok';
     show(
       `$(vm-running) sbx: ${name} $(check)`,
@@ -282,24 +630,75 @@ async function toggle(context) {
   const wrapper = currentWrapper();
 
   if (isSbxWrapper(wrapper)) {
-    await context.globalState.update(LAST_WRAPPER_KEY, wrapper);
+    // Remember only a wrapper you set yourself, never one that came from workspace settings.
+    if (info && isSbxWrapper(String(info.globalValue || ''))) await context.globalState.update(LAST_WRAPPER_KEY, info.globalValue);
     // Clear it wherever it's set, otherwise a workspace value would keep overriding.
-    if (info && info.workspaceValue !== undefined) await conf.update(WRAPPER_KEY, undefined, vscode.ConfigurationTarget.Workspace);
+    await clearWorkspaceWrapper();
     if (info && info.globalValue !== undefined) await conf.update(WRAPPER_KEY, undefined, vscode.ConfigurationTarget.Global);
     await refresh();
     await offerReload('Claude sandbox wrapper turned off. Reload the window so the Claude panel runs locally.');
   } else {
-    const target = expandHome(context.globalState.get(LAST_WRAPPER_KEY) || cfg().get('wrapperPath', '~/bin/claude-sbx'));
+    const target = expandHome(context.globalState.get(LAST_WRAPPER_KEY) || userSetting('wrapperPath', DEFAULT_WRAPPER));
     if (!isExecutable(target)) {
       const choice = await vscode.window.showErrorMessage(`Wrapper not found or not executable: ${target}.`, 'Run setup');
       if (choice === 'Run setup') await setup(context);
       return;
     }
-    const scope = info && info.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
-    await conf.update(WRAPPER_KEY, target, scope);
+    const problem = await checkWrapper(context, target);
+    if (problem) {
+      stamp(`not turning on ${target}: ${problem}`);
+      const choice = await vscode.window.showErrorMessage(`Not turning on the wrapper: ${problem}.`, 'Run setup');
+      if (choice === 'Run setup') await setup(context);
+      return;
+    }
+    await setWrapperSetting(target);
     await refresh();
     await offerReload('Claude sandbox wrapper turned on. Reload the window so the Claude panel starts inside the sandbox.');
   }
+}
+
+/** Checks the open folders that a sandbox mounts for files tools on this machine run. Notifies once per new finding. */
+function scanHostRunFiles(list) {
+  const roots = allRoots(list);
+  const reviewed = ctx.globalState.get(REVIEWED_KEY) || [];
+  const findings = workspaceFolderPaths()
+    .filter((f) => mountedRoot(f, roots))
+    .flatMap((f) => hostRunFindings(f));
+  unreviewed = findings.filter((f) => !reviewed.includes(f.id));
+  const fresh = unreviewed.filter((f) => !notified.has(f.id));
+  if (!fresh.length) return;
+  fresh.forEach((f) => {
+    notified.add(f.id);
+    stamp(`host-run file in a mounted folder: ${f.file}: ${f.detail}`);
+  });
+  vscode.window
+    .showWarningMessage(
+      `${fresh.length} file(s) in a folder the sandbox can write would run code on this machine (git config or hooks, or VS Code tasks). Check that you made these changes.`,
+      'Review',
+      'Show log'
+    )
+    .then((choice) => {
+      if (choice === 'Review') reviewHostRun();
+      if (choice === 'Show log') log.show();
+    });
+}
+
+/** Shows the unreviewed findings and lets you mark them as reviewed. */
+async function reviewHostRun() {
+  if (!unreviewed.length) {
+    vscode.window.showInformationMessage('Nothing to review: no unreviewed git config, git hooks or auto-run tasks in mounted folders.');
+    return;
+  }
+  const items = unreviewed.map((f) => ({ label: path.basename(f.file), description: f.file, detail: f.detail, picked: false, finding: f }));
+  const picked = await vscode.window.showQuickPick(items, {
+    canPickMany: true,
+    placeHolder: 'Select the entries you made yourself and trust (Esc to cancel). Open a file to check it first.',
+  });
+  if (!picked || !picked.length) return;
+  const reviewed = ctx.globalState.get(REVIEWED_KEY) || [];
+  await ctx.globalState.update(REVIEWED_KEY, [...new Set([...reviewed, ...picked.map((p) => p.finding.id)])].slice(-500));
+  stamp(`marked as reviewed: ${picked.map((p) => `${p.finding.file}: ${p.finding.detail}`).join('; ')}`);
+  await refresh();
 }
 
 /** Asks once per folder per window whether to create a sandbox. Doesn't block refresh. */
@@ -334,7 +733,12 @@ function offerCreate(folder) {
  */
 async function createSandbox(opts = {}) {
   const folders = workspaceFolderPaths();
-  const sbx = opts.sbx || lastState.sbx || resolveSbx(expandHome(currentWrapper()));
+  // Only an sbx that passed refresh()'s or setup's checks.
+  const sbx = opts.sbx || lastState.sbx;
+  if (!sbx) {
+    vscode.window.showErrorMessage('Claude sbx: the wrapper or sbx failed its safety checks (hover the status bar badge). Run setup first.');
+    return undefined;
+  }
   if (!folders.length || creating) return undefined;
   creating = true;
   try {
@@ -351,6 +755,25 @@ async function createSandbox(opts = {}) {
       return existing.name;
     }
     const name = newSandboxName(list, folders[0]);
+    // The sandbox gets read-write access to every folder below.
+    const refusal =
+      mountRefusal(folders, { home: os.homedir(), wrapperPath: expandHome(currentWrapper()), sbx }) ||
+      mountRefusal(folders, { home: os.homedir(), wrapperPath: expandHome(userSetting('wrapperPath', DEFAULT_WRAPPER)) });
+    if (refusal) {
+      stamp(`not creating a sandbox: ${refusal}`);
+      vscode.window.showErrorMessage(
+        `Not creating a sandbox: ${refusal}. The sandbox could change files that run on this machine. Open a project folder instead.`
+      );
+      return undefined;
+    }
+    if (folders.length > 1) {
+      const choice = await vscode.window.showWarningMessage(
+        `Create sandbox ${name} with read-write access to all ${folders.length} open folders?`,
+        { modal: true, detail: folders.join('\n') },
+        'Create sandbox'
+      );
+      if (choice !== 'Create sandbox') return undefined;
+    }
     const args = ['create', '--name', name, 'claude', ...folders];
     log.appendLine(`[${new Date().toISOString()}] ${sbx} ${args.join(' ')} (in terminal)`);
     // Run in a real terminal: sbx create can stall without a TTY, and any prompt it shows can be answered there.
@@ -442,12 +865,38 @@ async function findSbx() {
 function wrapperText(context, sbx) {
   const template = fs.readFileSync(path.join(context.extensionPath, 'claude-sbx'), 'utf8');
   if (!SBX_BIN_LINE.test(template)) throw new Error('bundled claude-sbx has no SBX_BIN line to fill in');
-  return sbx.includes('/') ? template.replace(SBX_BIN_LINE, `SBX_BIN="\${CLAUDE_SBX_BIN:-${sbx}}"`) : template;
+  if (!sbx.includes('/')) return template;
+  if (!SAFE_SBX_PATH.test(sbx)) throw new Error(`the sbx path has characters that aren't safe to write into a shell script: ${JSON.stringify(sbx)}`);
+  // A function, so `$&`-style patterns in the path aren't expanded by replace().
+  return template.replace(SBX_BIN_LINE, () => `SBX_BIN="\${CLAUDE_SBX_BIN:-${sbx}}"`);
+}
+
+/**
+ * Every check to run before pointing the Claude extension at `wrapperPath`: file permissions and contents,
+ * the sbx it uses, and that neither is somewhere a sandbox mounts. Returns a problem, or undefined.
+ */
+async function checkWrapper(context, wrapperPath) {
+  const fileIssue = wrapperFileProblem(context, wrapperPath);
+  if (fileIssue) return fileIssue;
+  const sbx = resolveSbx(wrapperPath);
+  const sbxIssue = sbx.includes('/') ? fileProblem(sbx) : undefined;
+  if (sbxIssue) return `the sbx it runs isn't safe: ${sbxIssue}`;
+  let list;
+  try {
+    list = await sbxList(sbx);
+  } catch (e) {
+    return `couldn't list sandboxes to check where the wrapper is: ${e.message}`;
+  }
+  return locationProblem(wrapperPath, sbx, list);
 }
 
 /** Writes the wrapper to claudeSbx.wrapperPath. Asks before replacing a different file. Returns its path, or undefined if cancelled. */
-async function installWrapper(context, sbx) {
-  const target = expandHome(cfg().get('wrapperPath', '~/bin/claude-sbx'));
+async function installWrapper(context, sbx, list) {
+  const target = expandHome(userSetting('wrapperPath', DEFAULT_WRAPPER));
+  if (!path.isAbsolute(target)) throw new Error(`claudeSbx.wrapperPath must be an absolute path (or start with ~): ${target}`);
+  // Never put the wrapper where a sandbox could rewrite it.
+  const where = locationProblem(target, sbx, list);
+  if (where) throw new Error(where);
   const text = wrapperText(context, sbx);
   /** @type {string | undefined} */
   let existing;
@@ -458,6 +907,7 @@ async function installWrapper(context, sbx) {
   }
   if (existing === text) {
     fs.chmodSync(target, 0o755);
+    await trustWrapperText(context, text);
     stamp(`wrapper already up to date: ${target}`);
     return target;
   }
@@ -471,7 +921,8 @@ async function installWrapper(context, sbx) {
     if (!choice) return undefined;
     if (choice === 'Keep mine') {
       fs.chmodSync(target, 0o755);
-      stamp(`kept existing wrapper: ${target}`);
+      await trustWrapperText(context, existing); // you chose it, so the badge accepts it
+      stamp(`kept existing wrapper: ${target} (sha256 ${sha256(existing)})`);
       return target;
     }
     fs.copyFileSync(target, target + '.bak');
@@ -479,17 +930,18 @@ async function installWrapper(context, sbx) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, text, { mode: 0o755 });
   fs.chmodSync(target, 0o755);
+  await trustWrapperText(context, text);
   stamp(`installed wrapper: ${target} (sbx: ${sbx})`);
   return target;
 }
 
-/** Sets claudeCode.claudeProcessWrapper for the user, and for the workspace too if it overrides it there. */
+/**
+ * Sets claudeCode.claudeProcessWrapper in user settings and removes any workspace or folder value. The
+ * sandbox can write workspace settings, so the wrapper must come from user settings.
+ */
 async function setWrapperSetting(target) {
-  const conf = vscode.workspace.getConfiguration(CLAUDE_SECTION);
-  const info = conf.inspect(WRAPPER_KEY);
-  await conf.update(WRAPPER_KEY, target, vscode.ConfigurationTarget.Global);
-  if (info && info.workspaceValue !== undefined && info.workspaceValue !== target)
-    await conf.update(WRAPPER_KEY, target, vscode.ConfigurationTarget.Workspace);
+  await vscode.workspace.getConfiguration(CLAUDE_SECTION).update(WRAPPER_KEY, target, vscode.ConfigurationTarget.Global);
+  await clearWorkspaceWrapper();
 }
 
 /** Name of the sandbox Claude will use for the open folder, creating one if the user agrees. */
@@ -545,15 +997,26 @@ async function setup(context) {
     return;
   }
   stamp(`sbx: ${sbx}`);
+  const sbxIssue = sbx.includes('/') ? fileProblem(sbx) : undefined;
+  if (sbxIssue) return fail(`not using ${sbx}: ${sbxIssue}`);
+  // Needed to keep the wrapper out of every folder a sandbox mounts.
+  let list;
+  try {
+    list = await sbxList(sbx);
+  } catch (e) {
+    return fail(`couldn't list sandboxes: ${e.message}`);
+  }
 
   // 2. wrapper
   let wrapperPath;
   try {
-    wrapperPath = await installWrapper(context, sbx);
+    wrapperPath = await installWrapper(context, sbx, list);
   } catch (e) {
     return fail(`couldn't install the wrapper: ${e.message}`);
   }
   if (!wrapperPath) return stamp('setup cancelled');
+  const installedIssue = wrapperFileProblem(context, wrapperPath);
+  if (installedIssue) return fail(`the installed wrapper isn't safe to use: ${installedIssue}`);
 
   // 3. Claude extension setting
   await setWrapperSetting(wrapperPath);
@@ -606,8 +1069,11 @@ async function teardown(context) {
   if (info && isSbxWrapper(String(info.globalValue || ''))) await conf.update(WRAPPER_KEY, undefined, vscode.ConfigurationTarget.Global);
   stamp(`unset ${CLAUDE_SECTION}.${WRAPPER_KEY}`);
 
-  const target = expandHome(cfg().get('wrapperPath', '~/bin/claude-sbx'));
-  if (fs.existsSync(target)) {
+  const target = expandHome(userSetting('wrapperPath', DEFAULT_WRAPPER));
+  if (fs.existsSync(target) && !isKnownWrapper(context, target)) {
+    // Only ever offer to delete the wrapper itself, never some other file the setting points at.
+    stamp(`not offering to delete ${target}: it isn't the wrapper this extension installs`);
+  } else if (fs.existsSync(target)) {
     const choice = await vscode.window.showInformationMessage(
       `Claude no longer uses the sandbox. Also delete ${target}?`,
       'Delete wrapper',
@@ -665,11 +1131,13 @@ async function menu(context) {
       ? { label: '$(device-desktop) Run Claude locally', description: 'unset claudeCode.claudeProcessWrapper', run: () => toggle(context) }
       : { label: '$(vm) Run Claude in the sandbox', description: 'set claudeCode.claudeProcessWrapper', run: () => toggle(context) },
   ];
-  if (!on || lastState.kind === 'wrapper-missing')
+  if (!on || ['wrapper-missing', 'wrapper-unsafe', 'wrapper-workspace'].includes(lastState.kind))
     picks.unshift({ label: '$(rocket) Set up sandboxed Claude', description: 'install wrapper, pick sandbox, test', run: () => setup(context) });
   if (on && lastState.kind === 'stopped') picks.push({ label: '$(play) Start sandbox', description: lastState.sandbox, run: startSandbox });
   if (on && lastState.kind === 'no-sandbox')
     picks.push({ label: '$(add) Create sandbox for this folder', description: 'sbx create claude …', run: createSandbox });
+  if (on && unreviewed.length)
+    picks.push({ label: '$(shield) Review files that run on this machine', description: `${unreviewed.length} unreviewed`, run: reviewHostRun });
   if (on) picks.push({ label: '$(trash) Remove sandboxed Claude setup', description: 'unset wrapper, optionally delete it', run: () => teardown(context) });
   picks.push({ label: '$(output) Show log', run: () => log.show() });
 
@@ -705,6 +1173,13 @@ function activate(context) {
       if (e.affectsConfiguration(`${CLAUDE_SECTION}.${WRAPPER_KEY}`) || e.affectsConfiguration('claudeSbx')) refresh();
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => refresh()),
+    // Check right away when git config, hooks or tasks change, not just on the next timer tick.
+    ...['**/.git/config', '**/.git/hooks/*', '**/.vscode/tasks.json'].map((glob) => {
+      const w = vscode.workspace.createFileSystemWatcher(glob);
+      w.onDidCreate(() => refresh());
+      w.onDidChange(() => refresh());
+      return w;
+    }),
     vscode.window.onDidChangeWindowState((s) => s.focused && refresh()),
     { dispose: () => timer && clearInterval(timer) }
   );
@@ -720,5 +1195,26 @@ module.exports = {
   activate,
   deactivate,
   // Pure helpers, exported for the tests in test/.
-  _test: { expandHome, wrapperDefault, isUnder, sandboxRoots, sandboxForFolder, newSandboxName, wrapperText, isSbxWrapper },
+  _test: {
+    expandHome,
+    wrapperDefault,
+    isUnder,
+    sandboxRoots,
+    sandboxForFolder,
+    newSandboxName,
+    wrapperText,
+    isSbxWrapper,
+    fileProblem,
+    mountedRoot,
+    allRoots,
+    locationProblem,
+    isKnownWrapper,
+    wrapperFileProblem,
+    workspaceValueOf,
+    sha256,
+    parseGitConfig,
+    gitEntryRisk,
+    hostRunFindings,
+    mountRefusal,
+  },
 };
