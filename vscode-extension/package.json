@@ -1,8 +1,8 @@
 {
   "name": "claude-sbx-status",
   "displayName": "Claude sbx Status",
-  "description": "Status bar badge showing whether the Claude Code extension runs inside a Docker Sandbox (sbx).",
-  "version": "0.2.0",
+  "description": "Run the Claude Code VS Code extension inside a Docker Sandbox (sbx): one-command setup and a status bar badge.",
+  "version": "0.4.0",
   "publisher": "petterr-n",
   "license": "MIT",
   "repository": {
@@ -21,6 +21,14 @@
   ],
   "contributes": {
     "commands": [
+      {
+        "command": "claudeSbx.setup",
+        "title": "Claude sbx: Set Up Sandboxed Claude"
+      },
+      {
+        "command": "claudeSbx.teardown",
+        "title": "Claude sbx: Remove Sandboxed Claude Setup"
+      },
       {
         "command": "claudeSbx.menu",
         "title": "Claude sbx: Show Menu"
@@ -74,5 +82,8 @@
         }
       }
     }
+  },
+  "scripts": {
+    "vscode:prepublish": "cp ../claude-sbx ./claude-sbx && chmod +x ./claude-sbx"
   }
 }
