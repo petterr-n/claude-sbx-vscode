@@ -2,7 +2,7 @@
   "name": "claude-sbx-status",
   "displayName": "Claude sbx Status",
   "description": "Run the Claude Code VS Code extension inside a Docker Sandbox (sbx): one-command setup and a status bar badge.",
-  "version": "0.5.3",
+  "version": "0.5.8",
   "publisher": "petterr-n",
   "license": "MIT",
   "repository": {
@@ -27,7 +27,7 @@
       },
       {
         "command": "claudeSbx.teardown",
-        "title": "Claude sbx: Remove Sandboxed Claude Setup"
+        "title": "Claude sbx: Uninstall Sandbox Wrapper"
       },
       {
         "command": "claudeSbx.menu",
@@ -39,7 +39,7 @@
       },
       {
         "command": "claudeSbx.toggle",
-        "title": "Claude sbx: Toggle Sandbox Wrapper"
+        "title": "Claude sbx: Toggle Running Claude Inside/Outside Sandbox"
       },
       {
         "command": "claudeSbx.createSandbox",
@@ -47,7 +47,7 @@
       },
       {
         "command": "claudeSbx.removeSandbox",
-        "title": "Claude sbx: Remove Sandbox for This Folder"
+        "title": "Claude sbx: Delete Sandbox for This Folder"
       }
     ],
     "configuration": {
@@ -85,7 +85,7 @@
         "claudeSbx.showWhenLocal": {
           "type": "boolean",
           "default": true,
-          "description": "Show a 'Claude: local' badge when the sandbox wrapper isn't in use."
+          "description": "Show a 'Claude: no sandbox' badge when the sandbox wrapper isn't in use."
         }
       }
     }

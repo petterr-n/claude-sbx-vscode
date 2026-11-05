@@ -495,7 +495,7 @@ async function refresh() {
       lastState = { kind: 'local' };
       if (cfg().get('showWhenLocal', true)) {
         const note = wrapper ? `A different process wrapper is set: \`${wrapper}\`.` : 'No process wrapper is set.';
-        show('$(device-desktop) Claude: local', `**Claude runs directly on this machine**, not in a sandbox.\n\n${note}`, false);
+        show('$(device-desktop) Claude: no sandbox', `**Claude runs directly on this machine**, not in a sandbox.\n\n${note}`, false);
       } else {
         item.hide();
       }
@@ -618,25 +618,79 @@ async function refresh() {
   }
 }
 
-async function offerReload(message) {
-  const choice = await vscode.window.showInformationMessage(message, 'Reload Window');
-  if (choice === 'Reload Window') await vscode.commands.executeCommand('workbench.action.reloadWindow');
+/** True for the webview type of a Claude Code conversation tab (VS Code prefixes it, e.g. `mainThreadWebview-claudeVSCodePanel`). */
+function isClaudePanelViewType(viewType) {
+  return /claude/i.test(String(viewType || ''));
 }
 
-/** @param {vscode.ExtensionContext} context */
-async function toggle(context) {
+/**
+ * Closes open Claude Code conversation tabs. Run before switching between sandbox and local, or deleting a
+ * sandbox: the sandbox and this machine keep separate Claude history (~/.claude), so a tab the reloaded window
+ * restores would try to continue a conversation the other side doesn't have. Closing the tab also makes the Claude
+ * extension stop its process, so it isn't killed halfway through (or restarted, which would start a stopped sandbox).
+ * A Claude view docked in the sidebar isn't a tab and can't be closed from here.
+ */
+async function closeClaudePanels() {
+  const groups = vscode.window.tabGroups;
+  const WebviewInput = vscode.TabInputWebview;
+  if (!groups || !WebviewInput) return;
+  const tabs = groups.all
+    .flatMap((g) => g.tabs)
+    .filter((t) => t.input instanceof WebviewInput && isClaudePanelViewType(t.input.viewType));
+  if (!tabs.length) return;
+  try {
+    await groups.close(tabs, true);
+  } catch (e) {
+    stamp(`couldn't close Claude tabs: ${e.message}`);
+    return;
+  }
+  stamp(`closed ${tabs.length} Claude conversation tab(s)`);
+  // Give the Claude extension a moment to stop the process behind each tab.
+  await new Promise((r) => setTimeout(r, 750));
+}
+
+/** Closes Claude conversation tabs, then reloads, so the new window starts a fresh conversation in the right place. */
+async function reloadWindow() {
+  await closeClaudePanels();
+  await vscode.commands.executeCommand('workbench.action.reloadWindow');
+}
+
+async function offerReload(message) {
+  const choice = await vscode.window.showInformationMessage(message, 'Reload Window');
+  if (choice === 'Reload Window') await reloadWindow();
+}
+
+/**
+ * Switches the Claude panel between the sandbox and this machine. The switch only takes effect after a reload, and
+ * the open conversation can't continue on the other side, so it asks first, then closes Claude tabs and reloads.
+ * `confirm: false` skips the question (when you just picked this in another prompt).
+ * @param {vscode.ExtensionContext} context @param {{ confirm?: boolean }} [opts]
+ */
+async function toggle(context, opts = {}) {
   const conf = vscode.workspace.getConfiguration(CLAUDE_SECTION);
   const info = conf.inspect(WRAPPER_KEY);
   const wrapper = currentWrapper();
+  const ask = async (/** @type {string} */ title, /** @type {string} */ detail) => {
+    if (opts.confirm === false) return true;
+    const choice = await vscode.window.showWarningMessage(title, { modal: true, detail }, 'Switch and reload');
+    return choice === 'Switch and reload';
+  };
 
   if (isSbxWrapper(wrapper)) {
+    const go = await ask(
+      'Run Claude outside the sandbox?',
+      'Claude will run directly on this machine, with access to all your files.\n\n' +
+        'Open Claude conversations are closed and the window reloads. Conversations from the sandbox are stored there and ' +
+        "won't show up outside it; they come back when you switch back."
+    );
+    if (!go) return;
     // Remember only a wrapper you set yourself, never one that came from workspace settings.
     if (info && isSbxWrapper(String(info.globalValue || ''))) await context.globalState.update(LAST_WRAPPER_KEY, info.globalValue);
     // Clear it wherever it's set, otherwise a workspace value would keep overriding.
     await clearWorkspaceWrapper();
     if (info && info.globalValue !== undefined) await conf.update(WRAPPER_KEY, undefined, vscode.ConfigurationTarget.Global);
-    await refresh();
-    await offerReload('Claude sandbox wrapper turned off. Reload the window so the Claude panel runs locally.');
+    stamp('wrapper turned off, reloading');
+    await reloadWindow();
   } else {
     const target = expandHome(context.globalState.get(LAST_WRAPPER_KEY) || userSetting('wrapperPath', DEFAULT_WRAPPER));
     if (!isExecutable(target)) {
@@ -651,9 +705,15 @@ async function toggle(context) {
       if (choice === 'Run setup') await setup(context);
       return;
     }
+    const go = await ask(
+      'Run Claude inside the sandbox?',
+      'Open Claude conversations are closed and the window reloads. Conversations from outside the sandbox are stored on ' +
+        "this machine and won't show up inside it; they come back when you switch back."
+    );
+    if (!go) return;
     await setWrapperSetting(target);
-    await refresh();
-    await offerReload('Claude sandbox wrapper turned on. Reload the window so the Claude panel starts inside the sandbox.');
+    stamp(`wrapper turned on (${target}), reloading`);
+    await reloadWindow();
   }
 }
 
@@ -779,31 +839,57 @@ async function sbxInTerminal(sbx, args, title, isDone) {
 }
 
 /**
- * Removes the sandbox Claude uses for this folder (`sbx stop` if running, then `sbx rm <name>`), after asking. Files in mounted folders
- * stay; everything inside the sandbox goes. Afterwards refresh offers to create a new one.
+ * Sends SIGTERM to every `claude` process in the sandbox and waits (up to ~5s) for them to exit, so a later
+ * `sbx stop` has nothing left to SIGKILL. Best effort: any failure just falls through to the plain stop.
+ * Uses /proc rather than pkill, which the sandbox image may not have.
+ * @param {string} sbx @param {string} name @returns {Promise<void>}
  */
-async function removeSandbox() {
+function terminateClaudeGracefully(sbx, name) {
+  const script =
+    'pids=$(for d in /proc/[0-9]*; do [ "$(cat $d/comm 2>/dev/null)" = claude ] && echo ${d#/proc/}; done); ' +
+    '[ -z "$pids" ] && exit 0; kill -TERM $pids 2>/dev/null; ' +
+    'for i in 1 2 3 4 5 6 7 8 9 10; do ' +
+    'alive=; for p in $pids; do [ -d /proc/$p ] && alive=1; done; [ -z "$alive" ] && exit 0; sleep 0.5; done; exit 0';
+  return new Promise((resolve) => {
+    execFile(sbx, ['exec', name, 'sh', '-c', script], { timeout: 10000 }, (err) => {
+      stamp(err ? `graceful claude shutdown skipped: ${err.message}` : `claude in ${name} shut down gracefully`);
+      resolve();
+    });
+  });
+}
+
+/**
+ * Removes the sandbox Claude uses for this folder (`sbx stop` if running, then `sbx rm <name>`), after asking. Files in mounted folders
+ * stay; everything inside the sandbox goes. Afterwards it asks whether to create a new one or run Claude outside the sandbox.
+ */
+async function removeSandbox(context) {
   const { sandbox: name, sbx } = lastState;
   if (!name || !sbx) {
     vscode.window.showErrorMessage('Claude sbx: no sandbox to remove for this folder. Hover the status bar badge for details.');
     return;
   }
   const choice = await vscode.window.showWarningMessage(
-    `Remove sandbox ${name}?`,
+    `Delete sandbox ${name}?`,
     {
       modal: true,
       detail:
         'Deletes the sandbox and everything inside it: Claude\'s history and settings there, installed tools and temp files. ' +
         'Your project files on this machine are not touched.\n\nA Claude session running in this sandbox will stop.',
     },
-    'Remove sandbox'
+    'Delete sandbox'
   );
-  if (choice !== 'Remove sandbox') return;
+  if (choice !== 'Delete sandbox') return;
 
   // `sbx rm` refuses a running sandbox, so stop it first. Done = stopped or already gone.
   const current = async () => (await sbxList(sbx)).find((s) => s && s.name === name);
   const before = await current().catch(() => undefined);
+  // Close Claude tabs first: their conversations live in this sandbox and go with it, and a panel left open would
+  // restart Claude, and `sbx exec` would start the sandbox again while we stop it.
+  await closeClaudePanels();
   if (!before || String(before.status) === 'running') {
+    // `sbx stop` SIGKILLs whatever is running, which the Claude panel reports as "exited with code 137".
+    // SIGTERM claude first (e.g. a panel in the sidebar); the wrapper turns the resulting exit 143 into a normal exit.
+    if (before) await terminateClaudeGracefully(sbx, name);
     const stopped = await sbxInTerminal(sbx, ['stop', name], `Stopping sandbox ${name}`, async () => {
       const s = await current();
       return !s || String(s.status) !== 'running';
@@ -823,9 +909,17 @@ async function removeSandbox() {
     return;
   }
   stamp(`removed sandbox ${name}`);
-  // Let refresh offer to create a new sandbox for these folders right away.
-  workspaceFolderPaths().forEach((f) => offered.delete(f));
+  // The wrapper is still on, so the Claude panel can't start until there's a sandbox again (or the wrapper is
+  // off). Ask now, instead of leaving an error in the panel. Our prompt replaces refresh()'s own offer.
+  workspaceFolderPaths().forEach((f) => offered.add(f));
   await refresh();
+  const next = await vscode.window.showInformationMessage(
+    `Sandbox ${name} deleted. The Claude panel needs a sandbox, or to run outside one.`,
+    'Create new sandbox',
+    'Run outside sandbox'
+  );
+  if (next === 'Create new sandbox') await createSandbox();
+  else if (next === 'Run outside sandbox') await toggle(context, { confirm: false });
 }
 
 /**
@@ -1192,8 +1286,8 @@ async function menu(context) {
   const picks = [
     { label: '$(refresh) Refresh status', run: refresh },
     on
-      ? { label: '$(device-desktop) Run Claude locally', description: 'unset claudeCode.claudeProcessWrapper', run: () => toggle(context) }
-      : { label: '$(vm) Run Claude in the sandbox', description: 'set claudeCode.claudeProcessWrapper', run: () => toggle(context) },
+      ? { label: '$(device-desktop) Run Claude outside the sandbox', description: 'closes Claude tabs and reloads the window', run: () => toggle(context) }
+      : { label: '$(vm) Run Claude inside the sandbox', description: 'closes Claude tabs and reloads the window', run: () => toggle(context) },
   ];
   if (!on || ['wrapper-missing', 'wrapper-unsafe', 'wrapper-workspace'].includes(lastState.kind))
     picks.unshift({ label: '$(rocket) Set up sandboxed Claude', description: 'install wrapper, pick sandbox, test', run: () => setup(context) });
@@ -1201,10 +1295,10 @@ async function menu(context) {
   if (on && lastState.kind === 'no-sandbox')
     picks.push({ label: '$(add) Create sandbox for this folder', description: 'sbx create claude …', run: createSandbox });
   if (on && lastState.sandbox && ['ok', 'host-run', 'stopped', 'not-mounted'].includes(lastState.kind))
-    picks.push({ label: '$(close) Remove sandbox', description: `sbx stop + rm ${lastState.sandbox}`, run: removeSandbox });
+    picks.push({ label: '$(close) Delete sandbox', description: `deletes ${lastState.sandbox} and its contents (sbx stop + rm)`, run: () => removeSandbox(context) });
   if (on && unreviewed.length)
     picks.push({ label: '$(shield) Review files that run on this machine', description: `${unreviewed.length} unreviewed`, run: reviewHostRun });
-  if (on) picks.push({ label: '$(trash) Remove sandboxed Claude setup', description: 'unset wrapper, optionally delete it', run: () => teardown(context) });
+  if (on) picks.push({ label: '$(trash) Uninstall sandbox wrapper', description: 'undo setup; sandboxes are kept', run: () => teardown(context) });
   picks.push({ label: '$(output) Show log', run: () => log.show() });
 
   const pick = await vscode.window.showQuickPick(picks, { placeHolder: 'Claude sbx' });
@@ -1232,7 +1326,7 @@ function activate(context) {
     vscode.commands.registerCommand('claudeSbx.refresh', refresh),
     vscode.commands.registerCommand('claudeSbx.toggle', () => toggle(context)),
     vscode.commands.registerCommand('claudeSbx.createSandbox', () => createSandbox()),
-    vscode.commands.registerCommand('claudeSbx.removeSandbox', () => removeSandbox()),
+    vscode.commands.registerCommand('claudeSbx.removeSandbox', () => removeSandbox(context)),
     vscode.commands.registerCommand('claudeSbx.setup', () => setup(context)),
     vscode.commands.registerCommand('claudeSbx.teardown', () => teardown(context)),
     vscode.workspace.onDidChangeConfiguration((e) => {
@@ -1283,5 +1377,6 @@ module.exports = {
     gitEntryRisk,
     hostRunFindings,
     mountRefusal,
+    isClaudePanelViewType,
   },
 };

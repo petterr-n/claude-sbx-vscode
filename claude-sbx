@@ -55,6 +55,7 @@ if [[ -z "$SANDBOX" ]]; then
   if [[ $status -eq 1 ]]; then
     echo "claude-sbx: no Docker Sandbox mounts $PWD." >&2
     echo "Create one with: sbx create claude \"$PWD\"" >&2
+    echo "Or run Claude outside the sandbox: command palette > Claude sbx: Show Menu > Run Claude outside the sandbox." >&2
     exit 1
   elif [[ $status -ne 0 ]]; then
     # Couldn't read `sbx ls --json`: fall back to sbx's default name, <agent>-<folder>.
@@ -63,4 +64,16 @@ if [[ -z "$SANDBOX" ]]; then
 fi
 
 # -i keeps stdin open; NO -t: the extension speaks JSON over stdio and a TTY corrupts it.
-exec "$SBX_BIN" exec -i -w "$PWD" "$SANDBOX" claude "$@"
+#
+# Not `exec`: we stay as the parent so a deliberate shutdown (SIGTERM, exit 143) can be reported to the
+# Claude panel as a normal exit instead of an error. `<&0` keeps stdin attached (a plain `&` would
+# replace it with /dev/null). Other failures, including 137 (killed / out of memory), pass through.
+"$SBX_BIN" exec -i -w "$PWD" "$SANDBOX" claude "$@" <&0 &
+child=$!
+trap 'kill -TERM "$child" 2>/dev/null' TERM INT HUP
+rc=0
+wait "$child" || rc=$?
+# A trapped signal interrupts the first wait; wait again for the child's real exit status.
+if kill -0 "$child" 2>/dev/null; then wait "$child" || rc=$?; fi
+[[ $rc -eq 143 ]] && rc=0
+exit "$rc"
