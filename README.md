@@ -25,7 +25,11 @@ npx @vscode/vsce package
 code --install-extension claude-sbx-status-*.vsix
 ```
 
+If the `code` command isn't found (common on macOS), run **Shell Command: Install 'code' command in PATH** from the VS Code command palette first. Or install the file from VS Code: Extensions view → `…` menu → **Install from VSIX…**.
+
 ## Setup
+
+Claude in the sandbox uses your own Claude account or API key, not one from this project. Set up Claude authentication for Docker Sandboxes as described in the [Docker Sandboxes docs](https://docs.docker.com/ai/sandboxes/) before you start. Otherwise the setup check can pass but the Claude panel won't be able to sign in.
 
 1. Open your project folder in VS Code.
 2. Run **Claude sbx: Set Up Sandboxed Claude** from the command palette, or accept the prompt shown on first start. It installs the wrapper to `~/.local/bin/claude-sbx`, points the Claude extension at it, finds or creates a sandbox for the folder, and checks that Claude starts inside it.
@@ -41,10 +45,12 @@ cp claude-sbx ~/.local/bin/claude-sbx && chmod +x ~/.local/bin/claude-sbx
 sbx create claude ~/path/to/project
 ```
 
-Then add this to your VS Code user `settings.json` and reload the window:
+Then add this to your VS Code user `settings.json` and reload the window. Use the full path to the wrapper (`echo ~/.local/bin/claude-sbx` prints it):
 
 ```json
 "claudeCode.claudeProcessWrapper": "/Users/<you>/.local/bin/claude-sbx"
 ```
+
+On Linux the path is `/home/<you>/.local/bin/claude-sbx`.
 
 If VS Code can't find `sbx`, set `CLAUDE_SBX_BIN=/full/path/to/sbx`. To always use one sandbox, set `CLAUDE_SBX_NAME=<name>`.
