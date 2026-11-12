@@ -66,11 +66,12 @@ node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' -- "$@"
 }
 
 /** Runs the real claude-sbx wrapper from `cwd` with the fake sbx. Returns status, stderr and the parsed `sbx` argv. */
-function runWrapper({ cwd, sbx, args = [], env = {} }) {
+function runWrapper({ cwd, sbx, args = [], env = {}, home = tempDir() }) {
   const r = spawnSync('bash', [WRAPPER, ...args], {
     cwd,
     encoding: 'utf8',
-    env: { ...process.env, PWD: cwd, CLAUDE_SBX_NAME: '', ...env, CLAUDE_SBX_BIN: sbx },
+    // A temp HOME, so a "run outside the sandbox" flag on this machine doesn't change the result.
+    env: { ...process.env, HOME: home, PWD: cwd, CLAUDE_SBX_NAME: '', ...env, CLAUDE_SBX_BIN: sbx },
   });
   let argv;
   try {

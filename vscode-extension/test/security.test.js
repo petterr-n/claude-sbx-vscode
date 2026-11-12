@@ -105,3 +105,54 @@ test('workspaceValueOf reports a wrapper set by workspace or folder settings', (
   assert.equal(t.workspaceValueOf([undefined, { workspaceFolderValue: '/p/x' }]), '/p/x');
   assert.equal(t.workspaceValueOf([]), undefined);
 });
+
+/** A context whose globalState also records updates, for code that writes to it. */
+function writableContext(state = {}) {
+  const c = fakeContext(state);
+  c.globalState.update = async (k, v) => {
+    state[k] = v;
+  };
+  return c;
+}
+
+/** The wrapper as an older version of the extension shipped it: same header, no "run outside" flag. */
+function olderBundledWrapper(sbx) {
+  const text = fs.readFileSync(WRAPPER, 'utf8').replace(/\nLOCAL_FLAG=[\s\S]*?\nfi\n/, '\n');
+  assert.ok(!text.includes('LOCAL_FLAG'));
+  return text.replace(/^SBX_BIN=.*$/m, `SBX_BIN="\${CLAUDE_SBX_BIN:-${sbx}}"`);
+}
+
+test('upgradeInstalledWrapper replaces an older wrapper the extension installed, keeping its sbx path', async () => {
+  const dir = tempDir();
+  const sbx = writeExec(path.join(dir, 'bin', 'sbx'), '#!/bin/sh\n');
+  const old = olderBundledWrapper(sbx);
+  const file = writeExec(path.join(dir, 'home', 'claude-sbx'), old);
+  // Trusted by an older version (before installed hashes were tracked separately).
+  const ctx = writableContext({ 'claudeSbx.trustedWrapperHashes': [t.sha256(old)] });
+  assert.equal(t.installedByUs(ctx, old), true);
+  assert.equal(await t.upgradeInstalledWrapper(ctx, file), true);
+  const now = fs.readFileSync(file, 'utf8');
+  assert.equal(now, t.wrapperText(ctx, sbx));
+  assert.ok(now.includes('LOCAL_FLAG'));
+  assert.equal(fs.readFileSync(file + '.bak', 'utf8'), old);
+  assert.equal(t.isKnownWrapper(ctx, file), true);
+  // Already current: nothing to do.
+  assert.equal(await t.upgradeInstalledWrapper(ctx, file), false);
+});
+
+test('upgradeInstalledWrapper leaves untrusted or custom wrappers alone', async () => {
+  const dir = tempDir();
+  const sbx = writeExec(path.join(dir, 'bin', 'sbx'), '#!/bin/sh\n');
+  const old = olderBundledWrapper(sbx);
+  // Same text, but never trusted: could have been written by anyone.
+  const untrusted = writeExec(path.join(dir, 'a', 'claude-sbx'), old);
+  assert.equal(await t.upgradeInstalledWrapper(writableContext(), untrusted), false);
+  assert.equal(fs.readFileSync(untrusted, 'utf8'), old);
+  // A wrapper of your own that you chose to keep: trusted, but not ours.
+  const mineText = `#!/usr/bin/env bash\n# my wrapper\nSBX_BIN="\${CLAUDE_SBX_BIN:-${sbx}}"\nexec "$SBX_BIN" "$@"\n`;
+  const mine = writeExec(path.join(dir, 'b', 'claude-sbx'), mineText);
+  const ctx = writableContext({ 'claudeSbx.trustedWrapperHashes': [t.sha256(mineText)] });
+  assert.equal(t.installedByUs(ctx, mineText), false);
+  assert.equal(await t.upgradeInstalledWrapper(ctx, mine), false);
+  assert.equal(fs.readFileSync(mine, 'utf8'), mineText);
+});
