@@ -18,11 +18,11 @@ The status bar badge shows whether the Claude Code VS Code extension is running 
 | `sbx: <name> not found` / `sbx: error` / `sbx: wrapper missing` | Something is misconfigured; hover for details |
 | `Claude: no sandbox` | `claudeCode.claudeProcessWrapper` isn't set to `claude-sbx` |
 
-Click the badge to refresh, switch the wrapper on or off (then reload the window), start a stopped sandbox, create a sandbox for this folder, or remove it (`sbx rm`, asks first; your project files stay).
+Click the badge to refresh, switch between running Claude inside and outside the sandbox (opens a new Claude tab; only the very first switch on after an uninstall reloads the window), start a stopped sandbox, create a sandbox for this folder (then open a new Claude tab, no reload needed), or remove it (`sbx rm`, asks first; your project files stay).
 
 In sandboxed mode only (the wrapper is set), opening a folder that no sandbox mounts asks once per window: **Create sandbox** runs `sbx create --name claude-<folder> claude <folder>`. *Don't ask for this folder* remembers your choice.
 
-The badge reflects your settings and the sandbox state (`sbx ls --json`). It can't look inside the Claude panel, so after changing the wrapper setting, reload the window before trusting it.
+The badge reflects your settings and the sandbox state (`sbx ls --json`). It can't look inside the Claude panel, so after changing `claudeCode.claudeProcessWrapper` by hand, reload the window before trusting it. Switching from the menu keeps that setting and creates or deletes `~/.config/claude-sbx/local` instead, which the wrapper checks every time Claude starts.
 
 ## Settings
 

@@ -110,6 +110,7 @@ test('mountRefusal blocks home, its parents, and folders containing the wrapper 
   assert.match(t.mountRefusal(['/'], o), /home folder/);
   assert.match(t.mountRefusal(['/Users/me/proj', '/Users/me/bin'], o), /contains the wrapper/);
   assert.match(t.mountRefusal(['/opt'], o), /contains sbx/);
+  assert.match(t.mountRefusal(['/Users/me/.config'], o), /settings folder/);
   assert.equal(t.mountRefusal(['/Users/me/proj', '/Users/me/other'], o), undefined);
   assert.equal(t.mountRefusal(['/Users/me/proj'], { home, sbx: 'sbx' }), undefined);
 });

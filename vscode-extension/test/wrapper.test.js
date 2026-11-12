@@ -79,3 +79,34 @@ test('wrapper and extension pick the same sandbox', () => {
     assert.equal(fromWrapper, expected, `wrapper, ${rel}: ${r.stderr}`);
   }
 });
+
+/** A HOME with ~/.config/claude-sbx/local, i.e. "run Claude outside the sandbox". */
+function homeWithLocalFlag() {
+  const home = tempDir();
+  fs.mkdirSync(path.join(home, '.config', 'claude-sbx'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.config', 'claude-sbx', 'local'), '');
+  return home;
+}
+
+test('with the local flag, runs the host claude the extension passed, not sbx', () => {
+  const { root, sbx } = setup((r) => [{ name: 'claude-proj', workspaces: [path.join(r, 'proj')] }]);
+  const hostClaude = path.join(root, 'bin', 'claude');
+  fs.writeFileSync(hostClaude, `#!/usr/bin/env bash\nnode -e 'process.stdout.write(JSON.stringify(["host", ...process.argv.slice(1)]))' -- "$@"\n`);
+  fs.chmodSync(hostClaude, 0o755);
+  const r = runWrapper({ cwd: path.join(root, 'proj'), sbx, args: [hostClaude, '--output-format', 'stream-json'], home: homeWithLocalFlag() });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.argv, ['host', '--output-format', 'stream-json']);
+});
+
+test('with the local flag but no host claude, exits with an error instead of using the sandbox', () => {
+  const { root, sbx } = setup((r) => [{ name: 'claude-proj', workspaces: [path.join(r, 'proj')] }]);
+  const r = runWrapper({ cwd: path.join(root, 'proj'), sbx, args: ['--version'], home: homeWithLocalFlag() });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /outside the sandbox/);
+});
+
+test('the extension recognises the installed wrapper as supporting the local flag', () => {
+  const src = fs.readFileSync(path.resolve(__dirname, '..', 'extension.js'), 'utf8');
+  const marker = src.match(/const LOCAL_FLAG_MARKER = '([^']+)'/)[1];
+  assert.ok(fs.readFileSync(require('./helpers').WRAPPER, 'utf8').includes(marker));
+});

@@ -25,6 +25,8 @@ const NEVER_CREATE_KEY = 'claudeSbx.neverOfferCreate';
 const SETUP_PROMPTED_KEY = 'claudeSbx.setupPrompted';
 /** SHA-256 of wrapper files you installed or chose to keep during setup. */
 const TRUSTED_HASHES_KEY = 'claudeSbx.trustedWrapperHashes';
+/** SHA-256 of wrapper files this extension wrote itself (not ones you chose to keep). These get upgraded without asking. */
+const INSTALLED_HASHES_KEY = 'claudeSbx.installedWrapperHashes';
 const DEFAULT_WRAPPER = '~/.local/bin/claude-sbx';
 // The line in the bundled wrapper where setup writes in the sbx path it found.
 const SBX_BIN_LINE = /^SBX_BIN="\$\{CLAUDE_SBX_BIN:-[^}]*\}"$/m;
@@ -147,6 +149,8 @@ function locationProblem(wrapperPath, sbx, list) {
   const roots = allRoots(list);
   const w = mountedRoot(wrapperPath, roots);
   if (w) return `${wrapperPath} is inside ${w}, which a sandbox mounts, so code in the sandbox could change it`;
+  const f = mountedRoot(LOCAL_FLAG_DIR, roots);
+  if (f) return `${LOCAL_FLAG_DIR} is inside ${f}, which a sandbox mounts, so code in the sandbox could switch Claude out of it`;
   const s = sbx.includes('/') ? mountedRoot(sbx, roots) : undefined;
   if (s) return `sbx (${sbx}) is inside ${s}, which a sandbox mounts, so code in the sandbox could change it`;
   return undefined;
@@ -161,6 +165,68 @@ async function trustWrapperText(context, text) {
   const hashes = context.globalState.get(TRUSTED_HASHES_KEY) || [];
   const h = sha256(text);
   if (!hashes.includes(h)) await context.globalState.update(TRUSTED_HASHES_KEY, [...hashes, h].slice(-20));
+}
+
+/** Remembers wrapper text this extension wrote, so a later version can replace it without asking. */
+async function recordInstalledText(context, text) {
+  await trustWrapperText(context, text);
+  const hashes = context.globalState.get(INSTALLED_HASHES_KEY) || [];
+  const h = sha256(text);
+  if (!hashes.includes(h)) await context.globalState.update(INSTALLED_HASHES_KEY, [...hashes, h].slice(-20));
+}
+
+/** The first lines of a wrapper script (its header comment), to recognise older versions of the bundled one. */
+function headerOf(text) {
+  return text.split('\n').slice(0, 3).join('\n');
+}
+
+/**
+ * True if `text` is a wrapper this extension wrote (any version), so replacing it with the bundled one loses
+ * nothing you chose. Before 0.5.10 installed and kept wrappers shared one trusted list; a trusted file that still
+ * has the bundled wrapper's header counts as one we wrote.
+ */
+function installedByUs(context, text) {
+  const h = sha256(text);
+  if ((context.globalState.get(INSTALLED_HASHES_KEY) || []).includes(h)) return true;
+  if (!(context.globalState.get(TRUSTED_HASHES_KEY) || []).includes(h)) return false;
+  try {
+    return headerOf(text) === headerOf(fs.readFileSync(path.join(context.extensionPath, 'claude-sbx'), 'utf8'));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Replaces an older wrapper this extension installed with the bundled one, keeping the sbx path written into it
+ * and a copy as <file>.bak. The wrapper is read each time Claude starts, so this needs no reload. Files you chose
+ * to keep, or that fail the permission checks, are left alone. Returns true if it changed the file.
+ * @param {vscode.ExtensionContext} context @param {string} wrapperPath
+ */
+async function upgradeInstalledWrapper(context, wrapperPath) {
+  if (fileProblem(wrapperPath)) return false;
+  let existing;
+  try {
+    existing = fs.readFileSync(wrapperPath, 'utf8');
+  } catch {
+    return false;
+  }
+  const baked = defaultFromText(existing, 'CLAUDE_SBX_BIN');
+  if (baked === undefined || !installedByUs(context, existing)) return false;
+  if (baked.includes('/') && fileProblem(baked)) return false;
+  let text;
+  try {
+    text = wrapperText(context, baked);
+  } catch (e) {
+    stamp(`not upgrading ${wrapperPath}: ${e.message}`);
+    return false;
+  }
+  if (text === existing) return false;
+  fs.copyFileSync(wrapperPath, wrapperPath + '.bak');
+  fs.writeFileSync(wrapperPath, text, { mode: 0o755 });
+  fs.chmodSync(wrapperPath, 0o755);
+  await recordInstalledText(context, text);
+  stamp(`upgraded ${wrapperPath} to the wrapper bundled with this version (old copy: ${wrapperPath}.bak)`);
+  return true;
 }
 
 /**
@@ -366,8 +432,46 @@ function mountRefusal(folders, { home, wrapperPath, sbx }) {
     if (isUnder(home, f)) return `${f} is your home folder or contains it`;
     if (wrapperPath && path.isAbsolute(wrapperPath) && mountedRoot(wrapperPath, [f])) return `${f} contains the wrapper (${wrapperPath})`;
     if (sbx && sbx.includes('/') && mountedRoot(sbx, [f])) return `${f} contains sbx (${sbx})`;
+    if (isUnder(path.join(home, '.config', 'claude-sbx'), f)) return `${f} contains the Claude sbx settings folder`;
   }
   return undefined;
+}
+
+/**
+ * While this file exists, the wrapper runs the host's claude instead of the sandbox's (see claude-sbx). Switching
+ * by flag instead of by changing claudeCode.claudeProcessWrapper means a new Claude tab is enough, no reload.
+ */
+const LOCAL_FLAG_DIR = path.join(os.homedir(), '.config', 'claude-sbx');
+const LOCAL_FLAG = path.join(LOCAL_FLAG_DIR, 'local');
+/** Marker in the wrapper text: wrappers without it (older installs) ignore the flag. */
+const LOCAL_FLAG_MARKER = 'LOCAL_FLAG="$HOME/.config/claude-sbx/local"';
+
+function localFlagSet() {
+  return fs.existsSync(LOCAL_FLAG);
+}
+
+function setLocalFlag(on) {
+  if (on) {
+    fs.mkdirSync(LOCAL_FLAG_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(LOCAL_FLAG, 'Claude sbx: run Claude outside the sandbox. Delete this file to run inside it.\n');
+  } else {
+    fs.rmSync(LOCAL_FLAG, { force: true });
+  }
+}
+
+/** True if the wrapper file at `wrapperPath` honours the local flag. */
+function wrapperSupportsFlag(wrapperPath) {
+  try {
+    return fs.readFileSync(wrapperPath, 'utf8').includes(LOCAL_FLAG_MARKER);
+  } catch {
+    return false;
+  }
+}
+
+/** True if Claude runs inside the sandbox: the wrapper is set and not switched to run outside. */
+function runsInSandbox() {
+  const wrapper = currentWrapper();
+  return isSbxWrapper(wrapper) && !(localFlagSet() && wrapperSupportsFlag(expandHome(wrapper)));
 }
 
 function currentWrapper() {
@@ -521,6 +625,20 @@ async function refresh() {
     const fileIssue = wrapperFileProblem(ctx, wrapperPath);
     if (fileIssue) return untrusted(fileIssue);
 
+    if (localFlagSet() && wrapperSupportsFlag(wrapperPath)) {
+      lastState = { kind: 'local' };
+      if (cfg().get('showWhenLocal', true)) {
+        show(
+          '$(device-desktop) Claude: no sandbox',
+          `**Claude runs directly on this machine**, not in a sandbox.\n\nSwitched off with \`${LOCAL_FLAG}\`; pick **Run Claude inside the sandbox** to switch back.`,
+          false
+        );
+      } else {
+        item.hide();
+      }
+      return;
+    }
+
     const sbx = resolveSbx(wrapperPath);
     const sbxIssue = sbx.includes('/') ? fileProblem(sbx) : undefined;
     if (sbxIssue) return untrusted(`the sbx it runs isn't safe: ${sbxIssue}`);
@@ -623,6 +741,14 @@ function isClaudePanelViewType(viewType) {
   return /claude/i.test(String(viewType || ''));
 }
 
+/** Open Claude Code conversation tabs, in all editor groups. @returns {vscode.Tab[]} */
+function claudeTabs() {
+  const groups = vscode.window.tabGroups;
+  const WebviewInput = vscode.TabInputWebview;
+  if (!groups || !WebviewInput) return [];
+  return groups.all.flatMap((g) => g.tabs).filter((t) => t.input instanceof WebviewInput && isClaudePanelViewType(t.input.viewType));
+}
+
 /**
  * Closes open Claude Code conversation tabs. Run before switching between sandbox and local, or deleting a
  * sandbox: the sandbox and this machine keep separate Claude history (~/.claude), so a tab the reloaded window
@@ -630,16 +756,10 @@ function isClaudePanelViewType(viewType) {
  * extension stop its process, so it isn't killed halfway through (or restarted, which would start a stopped sandbox).
  * A Claude view docked in the sidebar isn't a tab and can't be closed from here.
  */
-async function closeClaudePanels() {
-  const groups = vscode.window.tabGroups;
-  const WebviewInput = vscode.TabInputWebview;
-  if (!groups || !WebviewInput) return;
-  const tabs = groups.all
-    .flatMap((g) => g.tabs)
-    .filter((t) => t.input instanceof WebviewInput && isClaudePanelViewType(t.input.viewType));
+async function closeClaudePanels(tabs = claudeTabs()) {
   if (!tabs.length) return;
   try {
-    await groups.close(tabs, true);
+    await vscode.window.tabGroups.close(tabs, true);
   } catch (e) {
     stamp(`couldn't close Claude tabs: ${e.message}`);
     return;
@@ -660,30 +780,108 @@ async function offerReload(message) {
   if (choice === 'Reload Window') await reloadWindow();
 }
 
+/** Claude Code's "Open in New Tab" command. Each new tab starts its own `claude` process through the wrapper. */
+const CLAUDE_OPEN_TAB_COMMAND = 'claude-vscode.editor.open';
+
 /**
- * Switches the Claude panel between the sandbox and this machine. The switch only takes effect after a reload, and
- * the open conversation can't continue on the other side, so it asks first, then closes Claude tabs and reloads.
- * `confirm: false` skips the question (when you just picked this in another prompt).
+ * Restarts only the Claude panel: closes Claude conversation tabs and opens a fresh one. Enough when the sandbox
+ * changed (created, started, deleted) but the wrapper setting didn't, because the wrapper looks up the sandbox each
+ * time Claude starts. Falls back to reloading the window if the Claude extension doesn't have the command.
+ */
+async function restartClaudePanel() {
+  const commands = await vscode.commands.getCommands(true);
+  if (!commands.includes(CLAUDE_OPEN_TAB_COMMAND)) {
+    stamp(`${CLAUDE_OPEN_TAB_COMMAND} not found, reloading the window instead`);
+    await reloadWindow();
+    return;
+  }
+  // Open the new tab where the old one was (e.g. a Claude-only group on the right). Open it before closing the old
+  // tabs: closing the last tab in a group removes the group, and the new tab would land next to your files.
+  const old = claudeTabs();
+  const column = (old.find((t) => t.isActive) || old[0] || {}).group?.viewColumn;
+  const focusGroup = column && GROUP_FOCUS_COMMANDS[column - 1];
+  if (focusGroup) await vscode.commands.executeCommand(focusGroup);
+  try {
+    await vscode.commands.executeCommand(CLAUDE_OPEN_TAB_COMMAND);
+  } catch (e) {
+    stamp(`couldn't open a Claude tab: ${e.message}`);
+    vscode.window.showWarningMessage(`Couldn't open a new Claude tab (${e.message}). Reload the window instead.`);
+    return;
+  }
+  const opened = claudeTabs().find((t) => !old.includes(t));
+  stamp(`opened a new Claude tab${opened ? ` in group ${opened.group.viewColumn}` : ''}${column ? ` (old tab was in group ${column})` : ''}`);
+  await closeClaudePanels(old);
+}
+
+/** Focus commands for editor groups 1–8, indexed by viewColumn - 1. */
+const GROUP_FOCUS_COMMANDS = ['First', 'Second', 'Third', 'Fourth', 'Fifth', 'Sixth', 'Seventh', 'Eighth'].map(
+  (n) => `workbench.action.focus${n}EditorGroup`
+);
+
+async function offerRestartPanel(message) {
+  const choice = await vscode.window.showInformationMessage(message, 'Open Claude');
+  if (choice === 'Open Claude') await restartClaudePanel();
+}
+
+/** After a no-reload switch: replace open Claude tabs with a fresh one on the new side. */
+async function afterFlagSwitch() {
+  await refresh();
+  if (claudeTabs().length) await restartClaudePanel();
+}
+
+/**
+ * Switches the Claude panel between the sandbox and this machine. With a wrapper that knows the local flag, the
+ * wrapper setting stays put and only the flag changes, so a fresh Claude tab is enough. Otherwise (first switch on,
+ * or an older wrapper) the setting changes, which needs a reload. The open conversation can't continue on the other
+ * side, so it asks first. `confirm: false` skips the question (when you just picked this in another prompt).
  * @param {vscode.ExtensionContext} context @param {{ confirm?: boolean }} [opts]
  */
 async function toggle(context, opts = {}) {
   const conf = vscode.workspace.getConfiguration(CLAUDE_SECTION);
   const info = conf.inspect(WRAPPER_KEY);
   const wrapper = currentWrapper();
-  const ask = async (/** @type {string} */ title, /** @type {string} */ detail) => {
+  const wrapperPath = isSbxWrapper(wrapper) ? expandHome(wrapper) : '';
+  // The workspace can't set the wrapper we switch with: refresh() refuses to use a workspace value.
+  const canFlag = !!wrapperPath && workspaceWrapperValue() === undefined && wrapperSupportsFlag(wrapperPath);
+  const ask = async (/** @type {string} */ title, /** @type {string} */ detail, /** @type {boolean} */ reload) => {
     if (opts.confirm === false) return true;
-    const choice = await vscode.window.showWarningMessage(title, { modal: true, detail }, 'Switch and reload');
-    return choice === 'Switch and reload';
+    const button = reload ? 'Switch and reload' : 'Switch';
+    const what = reload ? 'Open Claude conversations are closed and the window reloads.' : 'Open Claude conversations are closed and a new one opens.';
+    const choice = await vscode.window.showWarningMessage(title, { modal: true, detail: detail.replace('{what}', what) }, button);
+    return choice === button;
   };
+  const outsideDetail =
+    'Claude will run directly on this machine, with access to all your files.\n\n' +
+    '{what} Conversations from the sandbox are stored there and ' +
+    "won't show up outside it; they come back when you switch back.";
+  const insideDetail =
+    '{what} Conversations from outside the sandbox are stored on ' + "this machine and won't show up inside it; they come back when you switch back.";
+
+  if (canFlag && !localFlagSet()) {
+    if (!(await ask('Run Claude outside the sandbox?', outsideDetail, false))) return;
+    setLocalFlag(true);
+    stamp(`created ${LOCAL_FLAG}: Claude runs outside the sandbox`);
+    await afterFlagSwitch();
+    return;
+  }
+  if (canFlag && localFlagSet()) {
+    const problem = await checkWrapper(context, wrapperPath);
+    if (problem) {
+      stamp(`not switching into the sandbox with ${wrapperPath}: ${problem}`);
+      const choice = await vscode.window.showErrorMessage(`Not switching into the sandbox: ${problem}.`, 'Run setup');
+      if (choice === 'Run setup') await setup(context);
+      return;
+    }
+    if (!(await ask('Run Claude inside the sandbox?', insideDetail, false))) return;
+    setLocalFlag(false);
+    stamp(`removed ${LOCAL_FLAG}: Claude runs inside the sandbox`);
+    await afterFlagSwitch();
+    return;
+  }
 
   if (isSbxWrapper(wrapper)) {
-    const go = await ask(
-      'Run Claude outside the sandbox?',
-      'Claude will run directly on this machine, with access to all your files.\n\n' +
-        'Open Claude conversations are closed and the window reloads. Conversations from the sandbox are stored there and ' +
-        "won't show up outside it; they come back when you switch back."
-    );
-    if (!go) return;
+    // An older wrapper that doesn't know the flag: turn the setting off, which needs a reload.
+    if (!(await ask('Run Claude outside the sandbox?', outsideDetail, true))) return;
     // Remember only a wrapper you set yourself, never one that came from workspace settings.
     if (info && isSbxWrapper(String(info.globalValue || ''))) await context.globalState.update(LAST_WRAPPER_KEY, info.globalValue);
     // Clear it wherever it's set, otherwise a workspace value would keep overriding.
@@ -705,12 +903,9 @@ async function toggle(context, opts = {}) {
       if (choice === 'Run setup') await setup(context);
       return;
     }
-    const go = await ask(
-      'Run Claude inside the sandbox?',
-      'Open Claude conversations are closed and the window reloads. Conversations from outside the sandbox are stored on ' +
-        "this machine and won't show up inside it; they come back when you switch back."
-    );
-    if (!go) return;
+    if (!(await ask('Run Claude inside the sandbox?', insideDetail, true))) return;
+    // The setting changes this once (needs a reload); later switches only use the flag.
+    setLocalFlag(false);
     await setWrapperSetting(target);
     stamp(`wrapper turned on (${target}), reloading`);
     await reloadWindow();
@@ -925,7 +1120,7 @@ async function removeSandbox(context) {
 /**
  * Creates one sandbox mounting all open folders, named like sbx's default (claude-<folder>).
  * Returns the name of the sandbox that mounts the folder afterwards, or undefined.
- * `quiet`: don't offer a reload at the end (setup does that itself).
+ * `quiet`: don't offer to open Claude at the end (setup does that itself).
  * @param {{ sbx?: string, quiet?: boolean }} [opts]
  * @returns {Promise<string | undefined>}
  */
@@ -979,7 +1174,7 @@ async function createSandbox(opts = {}) {
       return !!s && String(s.status) === 'running';
     });
     await refresh();
-    if (ok && !opts.quiet) await offerReload(`Sandbox ${name} created. Reload the window so the Claude panel starts inside it.`);
+    if (ok && !opts.quiet) await offerRestartPanel(`Sandbox ${name} created. Open a new Claude tab inside it?`);
     return ok ? name : undefined;
   } finally {
     creating = false;
@@ -1000,7 +1195,7 @@ function run(cmd, args, opts = {}) {
 }
 
 function stamp(msg) {
-  log.appendLine(`[${new Date().toISOString()}] ${msg}`);
+  if (log) log.appendLine(`[${new Date().toISOString()}] ${msg}`);
 }
 
 /** Full path to sbx: setting/env/usual places, else the user's login shell (GUI apps on macOS don't get its PATH). */
@@ -1065,11 +1260,15 @@ async function installWrapper(context, sbx, list) {
   }
   if (existing === text) {
     fs.chmodSync(target, 0o755);
-    await trustWrapperText(context, text);
+    await recordInstalledText(context, text);
     stamp(`wrapper already up to date: ${target}`);
     return target;
   }
-  if (existing !== undefined) {
+  if (existing !== undefined && installedByUs(context, existing)) {
+    // An older version of our own wrapper: nothing of yours to lose, so don't ask.
+    stamp(`replacing the older wrapper this extension installed: ${target}`);
+    fs.copyFileSync(target, target + '.bak');
+  } else if (existing !== undefined) {
     const choice = await vscode.window.showWarningMessage(
       `${target} already exists and is different from the wrapper bundled with this extension.`,
       { modal: true, detail: 'Replace keeps a copy of the old file as claude-sbx.bak.' },
@@ -1088,7 +1287,7 @@ async function installWrapper(context, sbx, list) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, text, { mode: 0o755 });
   fs.chmodSync(target, 0o755);
-  await trustWrapperText(context, text);
+  await recordInstalledText(context, text);
   stamp(`installed wrapper: ${target} (sbx: ${sbx})`);
   return target;
 }
@@ -1176,7 +1375,12 @@ async function setup(context) {
   const installedIssue = wrapperFileProblem(context, wrapperPath);
   if (installedIssue) return fail(`the installed wrapper isn't safe to use: ${installedIssue}`);
 
-  // 3. Claude extension setting
+  // 3. Claude extension setting. If it already pointed here, the Claude extension needs no reload: the wrapper
+  // file is read each time Claude starts.
+  const alreadySet = workspaceWrapperValue() === undefined && expandHome(currentWrapper()) === wrapperPath;
+  const done = (/** @type {string} */ msg) =>
+    alreadySet ? offerRestartPanel(`${msg} Open a new Claude tab?`) : offerReload(`${msg} Reload the window so the Claude panel uses it.`);
+  setLocalFlag(false);
   await setWrapperSetting(wrapperPath);
   await context.globalState.update(LAST_WRAPPER_KEY, wrapperPath);
   stamp(`set ${CLAUDE_SECTION}.${WRAPPER_KEY} = ${wrapperPath}`);
@@ -1184,7 +1388,7 @@ async function setup(context) {
 
   const folders = workspaceFolderPaths();
   if (!folders.length && !explicitSandboxName(wrapperPath)) {
-    await offerReload('Sandboxed Claude is set up. Open a folder to pick or create its sandbox, then reload.');
+    await done('Sandboxed Claude is set up. Open a folder to pick or create its sandbox.');
     return;
   }
 
@@ -1216,7 +1420,7 @@ async function setup(context) {
   await refresh();
 
   // 6. done
-  await offerReload(`Sandboxed Claude is ready: ${version} in sandbox ${sandbox}. Reload the window so the Claude panel starts inside it.`);
+  await done(`Sandboxed Claude is ready: ${version} in sandbox ${sandbox}.`);
 }
 
 /** Undo setup: unset the wrapper setting and optionally delete the wrapper file. */
@@ -1226,6 +1430,7 @@ async function teardown(context) {
   if (info && isSbxWrapper(String(info.workspaceValue || ''))) await conf.update(WRAPPER_KEY, undefined, vscode.ConfigurationTarget.Workspace);
   if (info && isSbxWrapper(String(info.globalValue || ''))) await conf.update(WRAPPER_KEY, undefined, vscode.ConfigurationTarget.Global);
   stamp(`unset ${CLAUDE_SECTION}.${WRAPPER_KEY}`);
+  setLocalFlag(false);
 
   const target = expandHome(userSetting('wrapperPath', DEFAULT_WRAPPER));
   if (fs.existsSync(target) && !isKnownWrapper(context, target)) {
@@ -1265,31 +1470,37 @@ function maybeOfferSetup(context) {
 async function startSandbox() {
   const { sandbox, sbx } = lastState;
   if (!sandbox || !sbx) return;
-  await vscode.window.withProgress(
+  const started = await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: `Starting sandbox ${sandbox}…` },
     () =>
       new Promise((resolve) => {
         // `sbx exec` starts a stopped sandbox before running the command.
         execFile(sbx, ['exec', sandbox, 'true'], { timeout: 120000 }, (err, _out, stderr) => {
           if (err) vscode.window.showErrorMessage(`Couldn't start ${sandbox}: ${(stderr || err.message).toString().trim()}`);
-          resolve(undefined);
+          resolve(!err);
         });
       })
   );
   await refresh();
+  // A Claude tab that failed while the sandbox was down won't retry on its own.
+  if (started) await offerRestartPanel(`Sandbox ${sandbox} is running. Open a new Claude tab inside it?`);
 }
 
 /** @param {vscode.ExtensionContext} context */
 async function menu(context) {
-  const on = isSbxWrapper(currentWrapper());
+  const installed = isSbxWrapper(currentWrapper());
+  const on = runsInSandbox();
+  // No reload when the wrapper stays set and only the local flag changes.
+  const noReload = installed && workspaceWrapperValue() === undefined && wrapperSupportsFlag(expandHome(currentWrapper()));
+  const switchNote = noReload ? 'opens a new Claude tab' : 'closes Claude tabs and reloads the window';
   /** @type {(vscode.QuickPickItem & { run: () => any })[]} */
   const picks = [
     { label: '$(refresh) Refresh status', run: refresh },
     on
-      ? { label: '$(device-desktop) Run Claude outside the sandbox', description: 'closes Claude tabs and reloads the window', run: () => toggle(context) }
-      : { label: '$(vm) Run Claude inside the sandbox', description: 'closes Claude tabs and reloads the window', run: () => toggle(context) },
+      ? { label: '$(device-desktop) Run Claude outside the sandbox', description: switchNote, run: () => toggle(context) }
+      : { label: '$(vm) Run Claude inside the sandbox', description: switchNote, run: () => toggle(context) },
   ];
-  if (!on || ['wrapper-missing', 'wrapper-unsafe', 'wrapper-workspace'].includes(lastState.kind))
+  if (!installed || ['wrapper-missing', 'wrapper-unsafe', 'wrapper-workspace'].includes(lastState.kind))
     picks.unshift({ label: '$(rocket) Set up sandboxed Claude', description: 'install wrapper, pick sandbox, test', run: () => setup(context) });
   if (on && lastState.kind === 'stopped') picks.push({ label: '$(play) Start sandbox', description: lastState.sandbox, run: startSandbox });
   if (on && lastState.kind === 'no-sandbox')
@@ -1298,7 +1509,7 @@ async function menu(context) {
     picks.push({ label: '$(close) Delete sandbox', description: `deletes ${lastState.sandbox} and its contents (sbx stop + rm)`, run: () => removeSandbox(context) });
   if (on && unreviewed.length)
     picks.push({ label: '$(shield) Review files that run on this machine', description: `${unreviewed.length} unreviewed`, run: reviewHostRun });
-  if (on) picks.push({ label: '$(trash) Uninstall sandbox wrapper', description: 'undo setup; sandboxes are kept', run: () => teardown(context) });
+  if (installed) picks.push({ label: '$(trash) Uninstall sandbox wrapper', description: 'undo setup; sandboxes are kept', run: () => teardown(context) });
   picks.push({ label: '$(output) Show log', run: () => log.show() });
 
   const pick = await vscode.window.showQuickPick(picks, { placeHolder: 'Claude sbx' });
@@ -1346,7 +1557,14 @@ function activate(context) {
   );
 
   schedule();
-  refresh();
+  // A new extension version may bring a new wrapper. Swap in the one it installed earlier, so features like
+  // switching without a reload work right away instead of after re-running setup.
+  const wrapper = currentWrapper();
+  const upgrade =
+    isSbxWrapper(wrapper) && workspaceWrapperValue() === undefined
+      ? upgradeInstalledWrapper(context, expandHome(wrapper)).catch((e) => stamp(`wrapper upgrade failed: ${e.message}`))
+      : Promise.resolve();
+  upgrade.then(() => refresh());
   maybeOfferSetup(context);
 }
 
@@ -1370,6 +1588,8 @@ module.exports = {
     allRoots,
     locationProblem,
     isKnownWrapper,
+    installedByUs,
+    upgradeInstalledWrapper,
     wrapperFileProblem,
     workspaceValueOf,
     sha256,
